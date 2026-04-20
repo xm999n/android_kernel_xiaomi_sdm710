@@ -100,6 +100,8 @@ static const u32 bbr_min_rtt_win_sec = 10;
 static const u32 bbr_probe_rtt_mode_ms = 200;
 /* Skip TSO below the following bandwidth (bits/sec): */
 static const int bbr_min_tso_rate = 1200000;
+/* Pace slightly below estimated bw to discourage standing queues. */
+static const int bbr_pacing_margin_percent = 1;
 
 /* We use a high_gain value of 2/ln(2) because it's the smallest pacing gain
  * that will allow a smoothly increasing pacing rate that will double each RTT
@@ -177,10 +179,10 @@ static u32 bbr_bw(const struct sock *sk)
  */
 static u64 bbr_rate_bytes_per_sec(struct sock *sk, u64 rate, int gain)
 {
-	rate *= tcp_mss_to_mtu(sk, tcp_sk(sk)->mss_cache);
+	rate *= tcp_sk(sk)->mss_cache;
 	rate *= gain;
 	rate >>= BBR_SCALE;
-	rate *= USEC_PER_SEC;
+	rate *= USEC_PER_SEC / 100 * (100 - bbr_pacing_margin_percent);
 	return rate >> BW_SCALE;
 }
 

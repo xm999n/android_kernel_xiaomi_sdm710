@@ -22,6 +22,7 @@ struct zcomp {
 	struct notifier_block notifier;
 
 	const char *name;
+	const char *driver_name;
 };
 
 ssize_t zcomp_available_show(const char *comp, char *buf);

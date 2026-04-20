@@ -1,0 +1,109 @@
+name: Build grus kernel
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+      - lineage-22.2
+  pull_request:
+    branches:
+      - main
+      - master
+      - lineage-22.2
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-grus-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    env:
+      OUT_DIR: ${{ github.workspace }}/out/grus-ci
+      TOOLCHAIN_DIR: ${{ runner.temp }}/toolchains
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc \
+            bison \
+            build-essential \
+            flex \
+            libelf-dev \
+            libssl-dev \
+            python3
+
+      - name: Download toolchains
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$TOOLCHAIN_DIR/clang-r536225" \
+                   "$TOOLCHAIN_DIR/aarch64-linux-android-4.9" \
+                   "$TOOLCHAIN_DIR/arm-linux-androideabi-4.9"
+
+          curl -fL \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/%2Barchive/7143812acf96c9af445b164656ae7f424a67a573/clang-r536225.tar.gz" \
+            | tar -xz -C "$TOOLCHAIN_DIR/clang-r536225"
+
+          curl -fL \
+            "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/%2Barchive/0a0604336d4d1067aa1aaef8d3779b31fcee841d.tar.gz" \
+            | tar -xz -C "$TOOLCHAIN_DIR/aarch64-linux-android-4.9"
+
+          curl -fL \
+            "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/%2Barchive/4d16d93f49c2b5ecdd0f12c38d194835dd595603.tar.gz" \
+            | tar -xz -C "$TOOLCHAIN_DIR/arm-linux-androideabi-4.9"
+
+      - name: Build kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x ./build-grus.sh
+          CLANG_DIR="$TOOLCHAIN_DIR/clang-r536225/bin" \
+          A64_DIR="$TOOLCHAIN_DIR/aarch64-linux-android-4.9/bin" \
+          ARM32_DIR="$TOOLCHAIN_DIR/arm-linux-androideabi-4.9/bin" \
+          OUT_DIR="$OUT_DIR" \
+          ./build-grus.sh
+
+      - name: Prepare artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARTIFACT_DIR="$RUNNER_TEMP/grus-artifacts"
+          mkdir -p "$ARTIFACT_DIR"
+
+          cp "$OUT_DIR/arch/arm64/boot/Image.gz" "$ARTIFACT_DIR/"
+          cp "$OUT_DIR/arch/arm64/boot/Image" "$ARTIFACT_DIR/"
+          cp "$OUT_DIR/arch/arm64/boot/dts/qcom/sdm670.dtb" "$ARTIFACT_DIR/"
+          cp "$OUT_DIR/arch/arm64/boot/dts/qcom/sdm710.dtb" "$ARTIFACT_DIR/"
+          cp "$OUT_DIR/arch/arm64/boot/dts/qcom/grus-sdm710-overlay.dtbo" "$ARTIFACT_DIR/"
+          cp "$OUT_DIR/.config" "$ARTIFACT_DIR/kernel.config"
+
+          if [[ -f "$GITHUB_WORKSPACE/boot.img" ]]; then
+            python3 merge_bootimg.py \
+              --boot "$GITHUB_WORKSPACE/boot.img" \
+              --kernel "$OUT_DIR/arch/arm64/boot/Image" \
+              --dtb "$OUT_DIR/arch/arm64/boot/dts/qcom/sdm670.dtb" \
+              --dtb "$OUT_DIR/arch/arm64/boot/dts/qcom/sdm710.dtb" \
+              --output "$ARTIFACT_DIR/boot-grus-ci.img"
+          fi
+
+          echo "ARTIFACT_DIR=$ARTIFACT_DIR" >> "$GITHUB_ENV"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: grus-kernel-${{ github.run_number }}
+          path: ${{ env.ARTIFACT_DIR }}
+          if-no-files-found: error

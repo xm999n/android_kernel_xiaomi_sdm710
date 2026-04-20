@@ -15,28 +15,49 @@
 #include <linux/sched.h>
 #include <linux/cpu.h>
 #include <linux/crypto.h>
+#include <linux/compiler.h>
 
 #include "zcomp.h"
 
-static const char * const backends[] = {
-	"lzo",
+struct zcomp_backend {
+	const char *name;
+	const char *driver_name;
+};
+
+static const struct zcomp_backend backends[] = {
+	{ "lzo", "lzo" },
 #if IS_ENABLED(CONFIG_CRYPTO_LZ4)
-	"lz4",
+	{ "lz4", "lz4" },
+#endif
+#if IS_ENABLED(CONFIG_CRYPTO_LZ4KD)
+	{ "lz4kd", "lz4kd" },
 #endif
 #if IS_ENABLED(CONFIG_CRYPTO_DEFLATE)
-	"deflate",
+	{ "deflate", "deflate" },
 #endif
 #if IS_ENABLED(CONFIG_CRYPTO_LZ4HC)
-	"lz4hc",
+	{ "lz4hc", "lz4hc" },
 #endif
 #if IS_ENABLED(CONFIG_CRYPTO_842)
-	"842",
+	{ "842", "842" },
 #endif
 #if IS_ENABLED(CONFIG_CRYPTO_ZSTD)
-	"zstd",
+	{ "zstd", "zstd" },
 #endif
-	NULL
+	{ NULL, NULL }
 };
+
+static const struct zcomp_backend *zcomp_find_backend(const char *name)
+{
+	int i;
+
+	for (i = 0; backends[i].name; i++) {
+		if (sysfs_streq(name, backends[i].name))
+			return &backends[i];
+	}
+
+	return NULL;
+}
 
 static void zcomp_strm_free(struct zcomp_strm *zstrm)
 {
@@ -56,7 +77,7 @@ static struct zcomp_strm *zcomp_strm_alloc(struct zcomp *comp)
 	if (!zstrm)
 		return NULL;
 
-	zstrm->tfm = crypto_alloc_comp(comp->name, 0, 0);
+	zstrm->tfm = crypto_alloc_comp(comp->driver_name, 0, 0);
 	/*
 	 * allocate 2 pages. 1 for compressed data, plus 1 extra for the
 	 * case when compressed size is larger than the original one
@@ -71,13 +92,11 @@ static struct zcomp_strm *zcomp_strm_alloc(struct zcomp *comp)
 
 bool zcomp_available_algorithm(const char *comp)
 {
-	int i = 0;
+	const struct zcomp_backend *backend;
 
-	while (backends[i]) {
-		if (sysfs_streq(comp, backends[i]))
-			return true;
-		i++;
-	}
+	backend = zcomp_find_backend(comp);
+	if (backend)
+		return true;
 
 	/*
 	 * Crypto does not ignore a trailing new line symbol,
@@ -96,14 +115,14 @@ ssize_t zcomp_available_show(const char *comp, char *buf)
 	ssize_t sz = 0;
 	int i = 0;
 
-	for (; backends[i]; i++) {
-		if (!strcmp(comp, backends[i])) {
+	for (; backends[i].name; i++) {
+		if (!strcmp(comp, backends[i].name)) {
 			known_algorithm = true;
 			sz += scnprintf(buf + sz, PAGE_SIZE - sz - 2,
-					"[%s] ", backends[i]);
+					"[%s] ", backends[i].name);
 		} else {
 			sz += scnprintf(buf + sz, PAGE_SIZE - sz - 2,
-					"%s ", backends[i]);
+					"%s ", backends[i].name);
 		}
 	}
 
@@ -254,6 +273,7 @@ void zcomp_destroy(struct zcomp *comp)
 struct zcomp *zcomp_create(const char *compress)
 {
 	struct zcomp *comp;
+	const struct zcomp_backend *backend;
 	int error;
 
 	if (!zcomp_available_algorithm(compress))
@@ -264,6 +284,8 @@ struct zcomp *zcomp_create(const char *compress)
 		return ERR_PTR(-ENOMEM);
 
 	comp->name = compress;
+	backend = zcomp_find_backend(compress);
+	comp->driver_name = backend ? backend->driver_name : compress;
 	error = zcomp_init(comp);
 	if (error) {
 		kfree(comp);

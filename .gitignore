@@ -69,6 +69,12 @@ Module.symvers
 !.gitignore
 !.mailmap
 !.cocciconfig
+!.github
+!.github/**
+
+/out/
+/__pycache__/
+/boot-*.img
 
 #
 # Generated include files
