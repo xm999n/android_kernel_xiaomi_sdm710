@@ -27,7 +27,7 @@ jobs:
 
     env:
       OUT_DIR: ${{ github.workspace }}/out/grus-ci
-      TOOLCHAIN_DIR: ${{ runner.temp }}/toolchains
+      TOOLCHAIN_DIR: ${{ github.workspace }}/.ci-toolchains
 
     steps:
       - name: Checkout
