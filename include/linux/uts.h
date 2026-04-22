@@ -16,4 +16,9 @@
 #define UTS_DOMAINNAME "(none)"	/* set by setdomainname() */
 #endif
 
+
+#ifndef UTS_UNAME_RELEASE_BASE
+#define UTS_UNAME_RELEASE_BASE "5.20.1314"
+#endif
+
 #endif

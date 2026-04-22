@@ -39,6 +39,7 @@
 #include <linux/mount.h>
 #include <linux/gfp.h>
 #include <linux/syscore_ops.h>
+#include <linux/uts.h>
 #include <linux/version.h>
 #include <linux/ctype.h>
 #include <linux/mm.h>
@@ -1138,6 +1139,28 @@ static int override_release(char __user *release, size_t len)
 		v = ((LINUX_VERSION_CODE >> 8) & 0xff) + 60;
 		copy = clamp_t(size_t, len, 1, sizeof(buf));
 		copy = scnprintf(buf, copy, "2.6.%u%s", v, rest);
+		ret = copy_to_user(release, buf, copy + 1);
+	} else if (UTS_UNAME_RELEASE_BASE[0]) {
+		const char *real = UTS_RELEASE;
+		const char *suffix = real;
+		char buf[65] = { 0 };
+		size_t copy;
+		int dots = 0;
+
+		while (*suffix) {
+			if (*suffix == '.')
+				dots++;
+			else if (!isdigit(*suffix))
+				break;
+
+			suffix++;
+			if (dots == 2 && !isdigit(*suffix))
+				break;
+		}
+
+		copy = clamp_t(size_t, len, 1, sizeof(buf));
+		copy = scnprintf(buf, copy, "%s%s",
+				 UTS_UNAME_RELEASE_BASE, suffix);
 		ret = copy_to_user(release, buf, copy + 1);
 	}
 	return ret;

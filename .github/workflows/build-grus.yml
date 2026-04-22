@@ -53,17 +53,34 @@ jobs:
                    "$TOOLCHAIN_DIR/aarch64-linux-android-4.9" \
                    "$TOOLCHAIN_DIR/arm-linux-androideabi-4.9"
 
-          curl -fL \
+          download_and_extract() {
+            local url="$1"
+            local dest_dir="$2"
+            local archive
+
+            archive="$(mktemp)"
+            curl --fail --location \
+              --retry 8 \
+              --retry-delay 5 \
+              --retry-all-errors \
+              --connect-timeout 30 \
+              --output "$archive" \
+              "$url"
+            tar -xzf "$archive" -C "$dest_dir"
+            rm -f "$archive"
+          }
+
+          download_and_extract \
             "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/%2Barchive/7143812acf96c9af445b164656ae7f424a67a573/clang-r536225.tar.gz" \
-            | tar -xz -C "$TOOLCHAIN_DIR/clang-r536225"
+            "$TOOLCHAIN_DIR/clang-r536225"
 
-          curl -fL \
+          download_and_extract \
             "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/%2Barchive/0a0604336d4d1067aa1aaef8d3779b31fcee841d.tar.gz" \
-            | tar -xz -C "$TOOLCHAIN_DIR/aarch64-linux-android-4.9"
+            "$TOOLCHAIN_DIR/aarch64-linux-android-4.9"
 
-          curl -fL \
+          download_and_extract \
             "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/%2Barchive/4d16d93f49c2b5ecdd0f12c38d194835dd595603.tar.gz" \
-            | tar -xz -C "$TOOLCHAIN_DIR/arm-linux-androideabi-4.9"
+            "$TOOLCHAIN_DIR/arm-linux-androideabi-4.9"
 
       - name: Build kernel
         shell: bash
