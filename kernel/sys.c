@@ -44,6 +44,8 @@
 #include <linux/ctype.h>
 #include <linux/mm.h>
 #include <linux/mempolicy.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 
 #include <linux/compat.h>
 #include <linux/syscalls.h>
@@ -109,6 +111,47 @@
 #ifndef SET_FP_MODE
 # define SET_FP_MODE(a,b)	(-EINVAL)
 #endif
+
+static bool uname_release_spoof_enabled;
+
+static int uname_release_spoof_proc_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", uname_release_spoof_enabled);
+	return 0;
+}
+
+static int uname_release_spoof_proc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, uname_release_spoof_proc_show, NULL);
+}
+
+static ssize_t uname_release_spoof_proc_write(struct file *file,
+		const char __user *buffer, size_t count, loff_t *ppos)
+{
+	int rc;
+
+	rc = kstrtobool_from_user(buffer, count, &uname_release_spoof_enabled);
+	if (rc)
+		return rc;
+
+	return count;
+}
+
+static const struct file_operations uname_release_spoof_proc_fops = {
+	.open		= uname_release_spoof_proc_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+	.write		= uname_release_spoof_proc_write,
+};
+
+static int __init uname_release_spoof_proc_init(void)
+{
+	proc_create("uname_release_spoof", 0644, NULL,
+		    &uname_release_spoof_proc_fops);
+	return 0;
+}
+fs_initcall(uname_release_spoof_proc_init);
 
 /*
  * this is where the system-wide overflow UID and GID are defined, for
@@ -1140,7 +1183,8 @@ static int override_release(char __user *release, size_t len)
 		copy = clamp_t(size_t, len, 1, sizeof(buf));
 		copy = scnprintf(buf, copy, "2.6.%u%s", v, rest);
 		ret = copy_to_user(release, buf, copy + 1);
-	} else if (UTS_UNAME_RELEASE_BASE[0]) {
+	} else if (UTS_UNAME_RELEASE_BASE[0] &&
+		   uname_release_spoof_enabled) {
 		const char *real = UTS_RELEASE;
 		const char *suffix = real;
 		char buf[65] = { 0 };
