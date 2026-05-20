@@ -23,6 +23,7 @@
 #include <linux/init.h>
 #include <linux/string.h>
 #include <linux/security.h>
+#include <linux/cred.h>
 #include <linux/major.h>
 #include <linux/seq_file.h>
 #include <linux/percpu.h>
@@ -40,6 +41,29 @@
 #include "security.h"
 #include "objsec.h"
 #include "conditional.h"
+
+extern bool kp_caller_is_app_zygote(u32 caller_sid);
+extern void kp_security_compute_av_user_clean(u32 ssid, u32 tsid,
+					     u16 tclass,
+					     struct av_decision *avd);
+extern bool kp_context_is_denied(const char *ctx);
+extern bool kp_access_edge_violates_user_policy(const char *scon,
+						const char *tcon);
+extern int kp_security_transition_sid_user_clean(u32 ssid, u32 tsid,
+						 u16 tclass,
+						 const char *objname,
+						 u32 *out_sid);
+extern int kp_security_member_sid_clean(u32 ssid, u32 tsid, u16 tclass,
+					u32 *out_sid);
+extern int kp_security_change_sid_clean(u32 ssid, u32 tsid, u16 tclass,
+					u32 *out_sid);
+
+static bool kp_current_is_app_zygote(void)
+{
+	const struct task_security_struct *tsec = current_security();
+
+	return kp_caller_is_app_zygote(tsec->sid);
+}
 
 /* Policy capability filenames */
 static char *policycap_names[] = {
@@ -425,6 +449,9 @@ static ssize_t sel_read_policy(struct file *filp, char __user *buf,
 	struct policy_load_memory *plm = filp->private_data;
 	int ret;
 
+	if (kp_current_is_app_zygote())
+		return -EACCES;
+
 	mutex_lock(&sel_mutex);
 
 	ret = task_has_security(current, SECURITY__READ_POLICY);
@@ -558,6 +585,15 @@ static ssize_t sel_write_context(struct file *file, char *buf, size_t size)
 	char *canon = NULL;
 	u32 sid, len;
 	ssize_t length;
+
+	/*
+	 * adb_root hide (step 1 of the AppZygote detector): reject context
+	 * validation of denylisted payloads (adbroot has no legitimate
+	 * querier) with the same -EINVAL a clean device without the domain
+	 * returns.
+	 */
+	if (kp_context_is_denied(buf))
+		return -EINVAL;
 
 	length = task_has_security(current, SECURITY__CHECK_CONTEXT);
 	if (length)
@@ -764,8 +800,9 @@ static const struct file_operations transaction_ops = {
 
 static ssize_t sel_write_access(struct file *file, char *buf, size_t size)
 {
+	const struct task_security_struct *tsec;
 	char *scon = NULL, *tcon = NULL;
-	u32 ssid, tsid;
+	u32 caller_sid, ssid, tsid;
 	u16 tclass;
 	struct av_decision avd;
 	ssize_t length;
@@ -796,7 +833,41 @@ static ssize_t sel_write_access(struct file *file, char *buf, size_t size)
 	if (length)
 		goto out;
 
-	security_compute_av_user(ssid, tsid, tclass, &avd);
+	/*
+	 * adb_root hide: adbroot is a debug domain compiled into the ROM
+	 * sepolicy; no legitimate user-space queries it, so filter it
+	 * unconditionally by payload (returns the same -EINVAL a clean
+	 * device without the domain gives).  Runtime-injected rules
+	 * (su/magisk, actively queried by su clients and managers) must
+	 * stay caller-gated below -- see the v2 design note in the commit
+	 * message: two dirty sources, two mechanisms.
+	 */
+	if (kp_context_is_denied(scon) || kp_context_is_denied(tcon)) {
+		length = -EINVAL;
+		goto out;
+	}
+
+	/* kept from 93239a2: caller-gated clean policydb answer (do NOT
+	 * make unconditional -- injected su/magisk rules are queried by
+	 * su clients / root managers and would break) */
+	tsec = current_security();
+	caller_sid = tsec->sid;
+	if (kp_caller_is_app_zygote(caller_sid)) {
+		kp_security_compute_av_user_clean(ssid, tsid, tclass, &avd);
+		/*
+		 * dirty-sepolicy hide: the ROM sepolicy itself contains
+		 * edges a stock user build must not allow (AOSP su
+		 * transition path, fsck_untrusted sys_admin capability);
+		 * the clean snapshot faithfully mirrors the ROM policy
+		 * and would still answer allowed.  Force these edges
+		 * denied for this carrier only -- su clients and root
+		 * managers query from shell/app domains and keep the
+		 * truthful live-policy answer, so su keeps working.
+		 */
+		if (kp_access_edge_violates_user_policy(scon, tcon))
+			avd.allowed = 0;
+	} else
+		security_compute_av_user(ssid, tsid, tclass, &avd);
 
 	length = scnprintf(buf, SIMPLE_TRANSACTION_LIMIT,
 			  "%x %x %x %x %u %x",
@@ -882,8 +953,25 @@ static ssize_t sel_write_create(struct file *file, char *buf, size_t size)
 	if (length)
 		goto out;
 
-	length = security_transition_sid_user(ssid, tsid, tclass,
-					      objname, &newsid);
+	/*
+	 * adb_root hide: unconditional payload denylist -- adbroot is a ROM
+	 * debug domain with no legitimate querier.  The clean-SID answer
+	 * below stays caller-gated (injected su/magisk rules are actively
+	 * queried by su clients / managers).
+	 */
+	if (kp_context_is_denied(scon) || kp_context_is_denied(tcon)) {
+		length = -EINVAL;
+		goto out;
+	}
+
+	if (kp_current_is_app_zygote())
+		length = kp_security_transition_sid_user_clean(ssid, tsid,
+							       tclass,
+							       objname,
+							       &newsid);
+	else
+		length = security_transition_sid_user(ssid, tsid, tclass,
+						      objname, &newsid);
 	if (length)
 		goto out;
 
@@ -943,7 +1031,22 @@ static ssize_t sel_write_relabel(struct file *file, char *buf, size_t size)
 	if (length)
 		goto out;
 
-	length = security_change_sid(ssid, tsid, tclass, &newsid);
+	/*
+	 * adb_root hide: unconditional payload denylist -- adbroot is a ROM
+	 * debug domain with no legitimate querier.  The clean-SID answer
+	 * below stays caller-gated (injected su/magisk rules are actively
+	 * queried by su clients / managers).
+	 */
+	if (kp_context_is_denied(scon) || kp_context_is_denied(tcon)) {
+		length = -EINVAL;
+		goto out;
+	}
+
+	if (kp_current_is_app_zygote())
+		length = kp_security_change_sid_clean(ssid, tsid, tclass,
+						      &newsid);
+	else
+		length = security_change_sid(ssid, tsid, tclass, &newsid);
 	if (length)
 		goto out;
 
@@ -994,6 +1097,15 @@ static ssize_t sel_write_user(struct file *file, char *buf, size_t size)
 	length = security_context_str_to_sid(con, &sid, GFP_KERNEL);
 	if (length)
 		goto out;
+
+	/*
+	 * adb_root hide: unconditional payload denylist -- adbroot is a ROM
+	 * debug domain with no legitimate querier.
+	 */
+	if (kp_context_is_denied(con)) {
+		length = -EINVAL;
+		goto out;
+	}
 
 	length = security_get_user_sids(sid, user, &sids, &nsids);
 	if (length)
@@ -1059,7 +1171,22 @@ static ssize_t sel_write_member(struct file *file, char *buf, size_t size)
 	if (length)
 		goto out;
 
-	length = security_member_sid(ssid, tsid, tclass, &newsid);
+	/*
+	 * adb_root hide: unconditional payload denylist -- adbroot is a ROM
+	 * debug domain with no legitimate querier.  The clean-SID answer
+	 * below stays caller-gated (injected su/magisk rules are actively
+	 * queried by su clients / managers).
+	 */
+	if (kp_context_is_denied(scon) || kp_context_is_denied(tcon)) {
+		length = -EINVAL;
+		goto out;
+	}
+
+	if (kp_current_is_app_zygote())
+		length = kp_security_member_sid_clean(ssid, tsid, tclass,
+						      &newsid);
+	else
+		length = security_member_sid(ssid, tsid, tclass, &newsid);
 	if (length)
 		goto out;
 

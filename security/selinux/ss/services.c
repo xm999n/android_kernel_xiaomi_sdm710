@@ -82,6 +82,10 @@ static struct sidtab sidtab;
 struct policydb policydb;
 int ss_initialized;
 
+static struct policydb kp_clean_policydb;
+static bool kp_clean_policydb_valid = false;
+static u32 kp_app_zygote_type_value = 0;
+
 /*
  * The largest sequence number that has been used when
  * providing an access decision to the access vector cache.
@@ -95,6 +99,13 @@ static int context_struct_to_string(struct context *context, char **scontext,
 				    u32 *scontext_len);
 
 static void context_struct_compute_av(struct context *scontext,
+					struct context *tcontext,
+					u16 tclass,
+					struct av_decision *avd,
+					struct extended_perms *xperms);
+
+static void kp_context_struct_compute_av(struct policydb *p,
+					struct context *scontext,
 					struct context *tcontext,
 					u16 tclass,
 					struct av_decision *avd,
@@ -592,6 +603,229 @@ static void type_attribute_bounds_av(struct context *scontext,
 				tclass, masked, "bounds");
 }
 
+static int kp_constraint_expr_eval(struct policydb *p,
+				   struct context *scontext,
+				   struct context *tcontext,
+				   struct context *xcontext,
+				   struct constraint_expr *cexpr)
+{
+	u32 val1, val2;
+	struct context *c;
+	struct role_datum *r1, *r2;
+	struct mls_level *l1, *l2;
+	struct constraint_expr *e;
+	int s[CEXPR_MAXDEPTH];
+	int sp = -1;
+
+	for (e = cexpr; e; e = e->next) {
+		switch (e->expr_type) {
+		case CEXPR_NOT:
+			BUG_ON(sp < 0);
+			s[sp] = !s[sp];
+			break;
+		case CEXPR_AND:
+			BUG_ON(sp < 1);
+			sp--;
+			s[sp] &= s[sp + 1];
+			break;
+		case CEXPR_OR:
+			BUG_ON(sp < 1);
+			sp--;
+			s[sp] |= s[sp + 1];
+			break;
+		case CEXPR_ATTR:
+			if (sp == (CEXPR_MAXDEPTH - 1))
+				return 0;
+			switch (e->attr) {
+			case CEXPR_USER:
+				val1 = scontext->user;
+				val2 = tcontext->user;
+				break;
+			case CEXPR_TYPE:
+				val1 = scontext->type;
+				val2 = tcontext->type;
+				break;
+			case CEXPR_ROLE:
+				val1 = scontext->role;
+				val2 = tcontext->role;
+				r1 = p->role_val_to_struct[val1 - 1];
+				r2 = p->role_val_to_struct[val2 - 1];
+				switch (e->op) {
+				case CEXPR_DOM:
+					s[++sp] = ebitmap_get_bit(&r1->dominates,
+								  val2 - 1);
+					continue;
+				case CEXPR_DOMBY:
+					s[++sp] = ebitmap_get_bit(&r2->dominates,
+								  val1 - 1);
+					continue;
+				case CEXPR_INCOMP:
+					s[++sp] = (!ebitmap_get_bit(&r1->dominates,
+								    val2 - 1) &&
+						   !ebitmap_get_bit(&r2->dominates,
+								    val1 - 1));
+					continue;
+				default:
+					break;
+				}
+				break;
+			case CEXPR_L1L2:
+				l1 = &(scontext->range.level[0]);
+				l2 = &(tcontext->range.level[0]);
+				goto mls_ops;
+			case CEXPR_L1H2:
+				l1 = &(scontext->range.level[0]);
+				l2 = &(tcontext->range.level[1]);
+				goto mls_ops;
+			case CEXPR_H1L2:
+				l1 = &(scontext->range.level[1]);
+				l2 = &(tcontext->range.level[0]);
+				goto mls_ops;
+			case CEXPR_H1H2:
+				l1 = &(scontext->range.level[1]);
+				l2 = &(tcontext->range.level[1]);
+				goto mls_ops;
+			case CEXPR_L1H1:
+				l1 = &(scontext->range.level[0]);
+				l2 = &(scontext->range.level[1]);
+				goto mls_ops;
+			case CEXPR_L2H2:
+				l1 = &(tcontext->range.level[0]);
+				l2 = &(tcontext->range.level[1]);
+				goto mls_ops;
+mls_ops:
+				switch (e->op) {
+				case CEXPR_EQ:
+					s[++sp] = mls_level_eq(l1, l2);
+					continue;
+				case CEXPR_NEQ:
+					s[++sp] = !mls_level_eq(l1, l2);
+					continue;
+				case CEXPR_DOM:
+					s[++sp] = mls_level_dom(l1, l2);
+					continue;
+				case CEXPR_DOMBY:
+					s[++sp] = mls_level_dom(l2, l1);
+					continue;
+				case CEXPR_INCOMP:
+					s[++sp] = mls_level_incomp(l2, l1);
+					continue;
+				default:
+					BUG();
+					return 0;
+				}
+				break;
+			default:
+				BUG();
+				return 0;
+			}
+
+			switch (e->op) {
+			case CEXPR_EQ:
+				s[++sp] = (val1 == val2);
+				break;
+			case CEXPR_NEQ:
+				s[++sp] = (val1 != val2);
+				break;
+			default:
+				BUG();
+				return 0;
+			}
+			break;
+		case CEXPR_NAMES:
+			if (sp == (CEXPR_MAXDEPTH-1))
+				return 0;
+			c = scontext;
+			if (e->attr & CEXPR_TARGET)
+				c = tcontext;
+			else if (e->attr & CEXPR_XTARGET) {
+				c = xcontext;
+				if (!c) {
+					BUG();
+					return 0;
+				}
+			}
+			if (e->attr & CEXPR_USER)
+				val1 = c->user;
+			else if (e->attr & CEXPR_ROLE)
+				val1 = c->role;
+			else if (e->attr & CEXPR_TYPE)
+				val1 = c->type;
+			else {
+				BUG();
+				return 0;
+			}
+
+			switch (e->op) {
+			case CEXPR_EQ:
+				s[++sp] = ebitmap_get_bit(&e->names, val1 - 1);
+				break;
+			case CEXPR_NEQ:
+				s[++sp] = !ebitmap_get_bit(&e->names, val1 - 1);
+				break;
+			default:
+				BUG();
+				return 0;
+			}
+			break;
+		default:
+			BUG();
+			return 0;
+		}
+	}
+
+	BUG_ON(sp != 0);
+	return s[0];
+}
+
+static void kp_type_attribute_bounds_av(struct policydb *p,
+					struct context *scontext,
+					struct context *tcontext,
+					u16 tclass,
+					struct av_decision *avd)
+{
+	struct context lo_scontext;
+	struct context lo_tcontext, *tcontextp = tcontext;
+	struct av_decision lo_avd;
+	struct type_datum *source;
+	struct type_datum *target;
+	u32 masked = 0;
+
+	source = flex_array_get_ptr(p->type_val_to_struct_array,
+				    scontext->type - 1);
+	BUG_ON(!source);
+
+	if (!source->bounds)
+		return;
+
+	target = flex_array_get_ptr(p->type_val_to_struct_array,
+				    tcontext->type - 1);
+	BUG_ON(!target);
+
+	memset(&lo_avd, 0, sizeof(lo_avd));
+
+	memcpy(&lo_scontext, scontext, sizeof(lo_scontext));
+	lo_scontext.type = source->bounds;
+
+	if (target->bounds) {
+		memcpy(&lo_tcontext, tcontext, sizeof(lo_tcontext));
+		lo_tcontext.type = target->bounds;
+		tcontextp = &lo_tcontext;
+	}
+
+	kp_context_struct_compute_av(p, &lo_scontext,
+				     tcontextp,
+				     tclass,
+				     &lo_avd,
+				     NULL);
+
+	masked = ~lo_avd.allowed & avd->allowed;
+	if (likely(!masked))
+		return;
+
+	avd->allowed &= ~masked;
+}
+
 /*
  * flag which drivers have permissions
  * only looking for ioctl based extended permssions
@@ -724,6 +958,89 @@ static void context_struct_compute_av(struct context *scontext,
 	 */
 	type_attribute_bounds_av(scontext, tcontext,
 				 tclass, avd);
+}
+
+static void kp_context_struct_compute_av(struct policydb *p,
+					struct context *scontext,
+					struct context *tcontext,
+					u16 tclass,
+					struct av_decision *avd,
+					struct extended_perms *xperms)
+{
+	struct constraint_node *constraint;
+	struct role_allow *ra;
+	struct avtab_key avkey;
+	struct avtab_node *node;
+	struct class_datum *tclass_datum;
+	struct ebitmap *sattr, *tattr;
+	struct ebitmap_node *snode, *tnode;
+	unsigned int i, j;
+
+	avd->allowed = 0;
+	avd->auditallow = 0;
+	avd->auditdeny = 0xffffffff;
+	if (xperms) {
+		memset(&xperms->drivers, 0, sizeof(xperms->drivers));
+		xperms->len = 0;
+	}
+
+	if (unlikely(!tclass || tclass > p->p_classes.nprim)) {
+		if (printk_ratelimit())
+			printk(KERN_WARNING "SELinux:  Invalid class %hu\n", tclass);
+		return;
+	}
+
+	tclass_datum = p->class_val_to_struct[tclass - 1];
+
+	avkey.target_class = tclass;
+	avkey.specified = AVTAB_AV | AVTAB_XPERMS;
+	sattr = flex_array_get(p->type_attr_map_array, scontext->type - 1);
+	BUG_ON(!sattr);
+	tattr = flex_array_get(p->type_attr_map_array, tcontext->type - 1);
+	BUG_ON(!tattr);
+	ebitmap_for_each_positive_bit(sattr, snode, i) {
+		ebitmap_for_each_positive_bit(tattr, tnode, j) {
+			avkey.source_type = i + 1;
+			avkey.target_type = j + 1;
+			for (node = avtab_search_node(&p->te_avtab, &avkey);
+			     node;
+			     node = avtab_search_node_next(node, avkey.specified)) {
+				if (node->key.specified == AVTAB_ALLOWED)
+					avd->allowed |= node->datum.u.data;
+				else if (node->key.specified == AVTAB_AUDITALLOW)
+					avd->auditallow |= node->datum.u.data;
+				else if (node->key.specified == AVTAB_AUDITDENY)
+					avd->auditdeny &= node->datum.u.data;
+				else if (xperms && (node->key.specified & AVTAB_XPERMS))
+					services_compute_xperms_drivers(xperms, node);
+			}
+
+			cond_compute_av(&p->te_cond_avtab, &avkey, avd, xperms);
+		}
+	}
+
+	constraint = tclass_datum->constraints;
+	while (constraint) {
+		if ((constraint->permissions & (avd->allowed)) &&
+		    !kp_constraint_expr_eval(p, scontext, tcontext, NULL,
+					    constraint->expr))
+			avd->allowed &= ~(constraint->permissions);
+		constraint = constraint->next;
+	}
+
+	if (tclass == p->process_class &&
+	    (avd->allowed & p->process_trans_perms) &&
+	    scontext->role != tcontext->role) {
+		for (ra = p->role_allow; ra; ra = ra->next) {
+			if (scontext->role == ra->role &&
+			    tcontext->role == ra->new_role)
+				break;
+		}
+		if (!ra)
+			avd->allowed &= ~p->process_trans_perms;
+	}
+
+	kp_type_attribute_bounds_av(p, scontext, tcontext, tclass, avd);
 }
 
 static int security_validtrans_handle_fail(struct context *ocontext,
@@ -1174,6 +1491,236 @@ allow:
 	goto out;
 }
 
+bool kp_caller_is_app_zygote(u32 caller_sid)
+{
+	struct context *ctx;
+	bool ret = false;
+
+	if (!kp_clean_policydb_valid || !kp_app_zygote_type_value)
+		return false;
+
+	read_lock(&policy_rwlock);
+	ctx = sidtab_search(&sidtab, caller_sid);
+	ret = ctx && ctx->type == kp_app_zygote_type_value;
+	read_unlock(&policy_rwlock);
+
+	return ret;
+}
+
+/*
+ * adb_root hide (setprocattr / setcon gate): a caller writing a denylisted
+ * (adbroot) context to /proc/self/attr/current is only legitimate from the
+ * root-trusted domains that perform the real adb root domain transition
+ * (adbd, init) or from root-solution domains (magisk, su).  Everyone else
+ * (notably app / isolated / app_zygote children probing for the hidden
+ * domain) gets -EINVAL, matching a clean device without the domain.
+ *
+ * The domain is looked up in the *current* policydb (injected su/magisk
+ * domains included), so root solutions that inject their own domains at
+ * runtime keep working.
+ */
+bool kp_caller_is_root_trusted(void)
+{
+	const struct task_security_struct *tsec = current_security();
+	struct context *ctx;
+	bool ret = false;
+
+	read_lock(&policy_rwlock);
+	ctx = sidtab_search(&sidtab, tsec->sid);
+	if (ctx) {
+		/*
+		 * Map the caller's type value back to its domain name via
+		 * the current policydb's p_types symtab (do NOT rely on
+		 * ctx->str: it is only set for contexts created from
+		 * strings, not for binary-policy-loaded ones).  The symtab
+		 * is keyed by name with no reverse map, so walk it and
+		 * compare datum values.  This runs only when a denylisted
+		 * setcon payload arrives, so the linear scan is fine.
+		 */
+		struct hashtab *t = policydb.p_types.table;
+		u32 i;
+
+		for (i = 0; i < t->size && !ret; i++) {
+			struct hashtab_node *n;
+
+			for (n = t->htable[i]; n; n = n->next) {
+				const struct type_datum *td = n->datum;
+
+				if (td->value == ctx->type) {
+					const char *name = n->key;
+					static const char * const trusted[] = {
+						"adbd", "init", "magisk", "su",
+					};
+					size_t j;
+
+					for (j = 0; j < ARRAY_SIZE(trusted);
+					     j++) {
+						if (!strcmp(name,
+							    trusted[j])) {
+							ret = true;
+							break;
+						}
+					}
+					break;
+				}
+			}
+		}
+	}
+	read_unlock(&policy_rwlock);
+
+	return ret;
+}
+
+/*
+ * adb_root hide: payload denylist (v2).
+ *
+ * Two dirty sources need two different mechanisms:
+ *  - "adbroot" is a debug domain compiled into the ROM sepolicy and loaded at
+ *    boot, so it is present in the clean policydb too -- it must be filtered
+ *    by payload (the context string contents), unconditionally for all
+ *    callers: no legitimate user-space component queries it, and returning
+ *    -EINVAL matches exactly the behavior of a clean device without the
+ *    domain.
+ *  - Runtime-injected rules (su/magisk domains via magiskpolicy) ARE actively
+ *    queried by su clients and root managers, so they must NOT be filtered;
+ *    they are only hidden via the caller-gated clean-policydb answers kept
+ *    from 93239a2 / 59c6205 (app_zygote callers only).
+ *
+ * Denylist contains ONLY debug domains like "adbroot"; never add su/magisk.
+ * Parse the type field (between the 2nd and 3rd ':') and compare it exactly
+ * against the denylist; do NOT strstr the whole string, to avoid matching
+ * normal contexts that merely contain the substring.  Parse failure -> false
+ * (allow).
+ */
+static const char * const kp_denied_types[] = {
+	"adbroot",
+};
+
+/* Extract the type field (between the 2nd and the 3rd ':') from a
+ * context string and compare it exactly against @type. */
+static bool kp_ctx_type_is(const char *ctx, const char *type)
+{
+	const char *p, *end;
+	size_t type_len;
+
+	if (!ctx || !type)
+		return false;
+
+	/* skip user and role fields */
+	p = strchr(ctx, ':');
+	if (!p)
+		return false;
+	p = strchr(p + 1, ':');
+	if (!p)
+		return false;
+	p++;
+
+	/*
+	 * The type field runs from here to the next ':' (the MLS level
+	 * field) or to the end of the string, whichever comes first.
+	 * "u:r:adbroot:s0", "u:r:adbroot:s0:c0" and "u:r:adbroot" all
+	 * yield type "adbroot".
+	 */
+	end = strchr(p, ':');
+	type_len = end ? (size_t)(end - p) : strlen(p);
+
+	return strlen(type) == type_len && !strncmp(type, p, type_len);
+}
+
+bool kp_context_is_denied(const char *ctx)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(kp_denied_types); i++) {
+		if (kp_ctx_type_is(ctx, kp_denied_types[i]))
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * Dirty-sepolicy hide: edges the ROM sepolicy itself contains but a
+ * stock user build must not allow.  The clean-policydb snapshot is a
+ * faithful copy of the ROM policy, so it still answers "allowed" for
+ * them and the detector reports a dirty sepolicy rule; force them
+ * denied in the app_zygote-gated path only (see sel_write_access()).
+ *
+ * su clients and root managers run in shell/app domains, hit the live
+ * policydb and keep the truthful answer, so su keeps working -- these
+ * edges are NEVER put into kp_denied_types[] (which would -EINVAL
+ * their queries for everyone, per the v2 red line).
+ */
+bool kp_access_edge_violates_user_policy(const char *scon, const char *tcon)
+{
+	/* shell -> su:process transition ("found AOSP su in user build") */
+	if (kp_ctx_type_is(tcon, "su"))
+		return true;
+
+	/* fsck_untrusted -> fsck_untrusted:capability sys_admin */
+	if (kp_ctx_type_is(scon, "fsck_untrusted") &&
+	    kp_ctx_type_is(tcon, "fsck_untrusted"))
+		return true;
+
+	return false;
+}
+
+void kp_security_compute_av_user_clean(u32 ssid,
+				       u32 tsid,
+				       u16 tclass,
+				       struct av_decision *avd)
+{
+	struct context *scontext = NULL, *tcontext = NULL;
+
+	if (!kp_clean_policydb_valid) {
+		security_compute_av_user(ssid, tsid, tclass, avd);
+		return;
+	}
+
+	read_lock(&policy_rwlock);
+	avd_init(avd);
+	if (!ss_initialized)
+		goto allow;
+
+	scontext = sidtab_search(&sidtab, ssid);
+	if (!scontext) {
+		printk(KERN_ERR "SELinux: %s:  unrecognized SID %d\n",
+		       __func__, ssid);
+		goto out;
+	}
+
+	if (scontext->type > kp_clean_policydb.p_types.nprim)
+		goto out;
+
+	if (ebitmap_get_bit(&kp_clean_policydb.permissive_map, scontext->type))
+		avd->flags |= AVD_FLAGS_PERMISSIVE;
+
+	tcontext = sidtab_search(&sidtab, tsid);
+	if (!tcontext) {
+		printk(KERN_ERR "SELinux: %s:  unrecognized SID %d\n",
+		       __func__, tsid);
+		goto out;
+	}
+
+	if (tcontext->type > kp_clean_policydb.p_types.nprim)
+		goto out;
+
+	if (unlikely(!tclass)) {
+		if (kp_clean_policydb.allow_unknown)
+			goto allow;
+		goto out;
+	}
+
+	kp_context_struct_compute_av(&kp_clean_policydb, scontext, tcontext,
+				     tclass, avd, NULL);
+out:
+	read_unlock(&policy_rwlock);
+	return;
+allow:
+	avd->allowed = 0xffffffff;
+	goto out;
+}
+
 /*
  * Write the security context string representation of
  * the context structure `context' into a dynamically
@@ -1393,6 +1940,46 @@ out:
 	return rc;
 }
 
+static u32 kp_current_sid(void)
+{
+	const struct task_security_struct *tsec = current_security();
+
+	return tsec->sid;
+}
+
+static int kp_clean_context_type_valid(char *scontext)
+{
+	struct type_datum *typdatum;
+	char *type, *end;
+	char saved;
+	int colons = 0;
+
+	type = scontext;
+	while (*type && colons < 2) {
+		if (*type == ':')
+			colons++;
+		type++;
+	}
+	if (colons < 2 || !*type)
+		return -EINVAL;
+
+	end = type;
+	while (*end && *end != ':')
+		end++;
+	if (end == type)
+		return -EINVAL;
+
+	saved = *end;
+	*end = '\0';
+	typdatum = hashtab_search(kp_clean_policydb.p_types.table, type);
+	*end = saved;
+
+	if (!typdatum || typdatum->attribute)
+		return -EINVAL;
+
+	return 0;
+}
+
 static int security_context_to_sid_core(const char *scontext, u32 scontext_len,
 					u32 *sid, u32 def_sid, gfp_t gfp_flags,
 					int force)
@@ -1429,6 +2016,12 @@ static int security_context_to_sid_core(const char *scontext, u32 scontext_len,
 		rc = -ENOMEM;
 		str = kstrdup(scontext2, gfp_flags);
 		if (!str)
+			goto out;
+	}
+
+	if (kp_clean_policydb_valid && kp_caller_is_app_zygote(kp_current_sid())) {
+		rc = kp_clean_context_type_valid(scontext2);
+		if (rc)
 			goto out;
 	}
 
@@ -1734,6 +2327,254 @@ out:
 	return rc;
 }
 
+static int kp_mls_compute_sid(struct policydb *p,
+			      struct context *scontext,
+			      struct context *tcontext,
+			      u16 tclass,
+			      u32 specified,
+			      struct context *newcontext,
+			      bool sock)
+{
+	struct range_trans rtr;
+	struct mls_range *r;
+	struct class_datum *cladatum;
+	int default_range = 0;
+
+	if (!p->mls_enabled)
+		return 0;
+
+	switch (specified) {
+	case AVTAB_TRANSITION:
+		rtr.source_type = scontext->type;
+		rtr.target_type = tcontext->type;
+		rtr.target_class = tclass;
+		r = hashtab_search(p->range_tr, &rtr);
+		if (r)
+			return mls_range_set(newcontext, r);
+
+		if (tclass && tclass <= p->p_classes.nprim) {
+			cladatum = p->class_val_to_struct[tclass - 1];
+			if (cladatum)
+				default_range = cladatum->default_range;
+		}
+
+		switch (default_range) {
+		case DEFAULT_SOURCE_LOW:
+			return mls_context_cpy_low(newcontext, scontext);
+		case DEFAULT_SOURCE_HIGH:
+			return mls_context_cpy_high(newcontext, scontext);
+		case DEFAULT_SOURCE_LOW_HIGH:
+			return mls_context_cpy(newcontext, scontext);
+		case DEFAULT_TARGET_LOW:
+			return mls_context_cpy_low(newcontext, tcontext);
+		case DEFAULT_TARGET_HIGH:
+			return mls_context_cpy_high(newcontext, tcontext);
+		case DEFAULT_TARGET_LOW_HIGH:
+			return mls_context_cpy(newcontext, tcontext);
+		}
+
+		/* Fallthrough */
+	case AVTAB_CHANGE:
+		if ((tclass == p->process_class) || (sock == true))
+			return mls_context_cpy(newcontext, scontext);
+		else
+			return mls_context_cpy_low(newcontext, scontext);
+	case AVTAB_MEMBER:
+		return mls_context_cpy_low(newcontext, scontext);
+	}
+
+	return -EINVAL;
+}
+
+static int kp_compute_sid_handle_invalid_context(void)
+{
+	if (!selinux_enforcing)
+		return 0;
+	return -EACCES;
+}
+
+static int kp_security_compute_sid_clean(u32 ssid,
+					 u32 tsid,
+					 u16 orig_tclass,
+					 u32 specified,
+					 const char *objname,
+					 u32 *out_sid)
+{
+	struct policydb *p = &kp_clean_policydb;
+	struct class_datum *cladatum = NULL;
+	struct context *scontext = NULL, *tcontext = NULL, newcontext;
+	struct role_trans *roletr = NULL;
+	struct avtab_key avkey;
+	struct avtab_datum *avdatum;
+	struct avtab_node *node;
+	u16 tclass = orig_tclass;
+	int rc = 0;
+	bool sock;
+
+	if (!kp_clean_policydb_valid)
+		return -EINVAL;
+
+	if (!ss_initialized) {
+		switch (orig_tclass) {
+		case SECCLASS_PROCESS:
+			*out_sid = ssid;
+			break;
+		default:
+			*out_sid = tsid;
+			break;
+		}
+		return 0;
+	}
+
+	context_init(&newcontext);
+
+	read_lock(&policy_rwlock);
+
+	sock = security_is_socket_class(map_class(tclass));
+
+	scontext = sidtab_search(&sidtab, ssid);
+	if (!scontext) {
+		printk(KERN_ERR "SELinux: %s:  unrecognized SID %d\n",
+		       __func__, ssid);
+		rc = -EINVAL;
+		goto out_unlock;
+	}
+	tcontext = sidtab_search(&sidtab, tsid);
+	if (!tcontext) {
+		printk(KERN_ERR "SELinux: %s:  unrecognized SID %d\n",
+		       __func__, tsid);
+		rc = -EINVAL;
+		goto out_unlock;
+	}
+
+	if (scontext->type > p->p_types.nprim ||
+	    tcontext->type > p->p_types.nprim) {
+		rc = -EINVAL;
+		goto out_unlock;
+	}
+
+	if (tclass && tclass <= p->p_classes.nprim)
+		cladatum = p->class_val_to_struct[tclass - 1];
+
+	switch (specified) {
+	case AVTAB_TRANSITION:
+	case AVTAB_CHANGE:
+		if (cladatum && cladatum->default_user == DEFAULT_TARGET)
+			newcontext.user = tcontext->user;
+		else
+			newcontext.user = scontext->user;
+		break;
+	case AVTAB_MEMBER:
+		newcontext.user = tcontext->user;
+		break;
+	}
+
+	if (cladatum && cladatum->default_role == DEFAULT_SOURCE) {
+		newcontext.role = scontext->role;
+	} else if (cladatum && cladatum->default_role == DEFAULT_TARGET) {
+		newcontext.role = tcontext->role;
+	} else {
+		if ((tclass == p->process_class) || (sock == true))
+			newcontext.role = scontext->role;
+		else
+			newcontext.role = OBJECT_R_VAL;
+	}
+
+	if (cladatum && cladatum->default_type == DEFAULT_SOURCE) {
+		newcontext.type = scontext->type;
+	} else if (cladatum && cladatum->default_type == DEFAULT_TARGET) {
+		newcontext.type = tcontext->type;
+	} else {
+		if ((tclass == p->process_class) || (sock == true))
+			newcontext.type = scontext->type;
+		else
+			newcontext.type = tcontext->type;
+	}
+
+	avkey.source_type = scontext->type;
+	avkey.target_type = tcontext->type;
+	avkey.target_class = tclass;
+	avkey.specified = specified;
+	avdatum = avtab_search(&p->te_avtab, &avkey);
+
+	if (!avdatum) {
+		node = avtab_search_node(&p->te_cond_avtab, &avkey);
+		for (; node; node = avtab_search_node_next(node, specified)) {
+			if (node->key.specified & AVTAB_ENABLED) {
+				avdatum = &node->datum;
+				break;
+			}
+		}
+	}
+
+	if (avdatum)
+		newcontext.type = avdatum->u.data;
+
+	if (objname)
+		filename_compute_type(p, &newcontext, scontext->type,
+				      tcontext->type, tclass, objname);
+
+	if (specified & AVTAB_TRANSITION) {
+		for (roletr = p->role_tr; roletr; roletr = roletr->next) {
+			if ((roletr->role == scontext->role) &&
+			    (roletr->type == tcontext->type) &&
+			    (roletr->tclass == tclass)) {
+				newcontext.role = roletr->new_role;
+				break;
+			}
+		}
+	}
+
+	rc = kp_mls_compute_sid(p, scontext, tcontext, tclass, specified,
+				&newcontext, sock);
+	if (rc)
+		goto out_unlock;
+
+	if (!policydb_context_isvalid(p, &newcontext)) {
+		rc = kp_compute_sid_handle_invalid_context();
+		if (rc)
+			goto out_unlock;
+	}
+
+	rc = sidtab_context_to_sid(&sidtab, &newcontext, out_sid);
+out_unlock:
+	read_unlock(&policy_rwlock);
+	context_destroy(&newcontext);
+	return rc;
+}
+
+int kp_security_transition_sid_user_clean(u32 ssid, u32 tsid, u16 tclass,
+					  const char *objname, u32 *out_sid)
+{
+	if (!kp_clean_policydb_valid)
+		return security_transition_sid_user(ssid, tsid, tclass,
+						    objname, out_sid);
+
+	return kp_security_compute_sid_clean(ssid, tsid, tclass,
+					     AVTAB_TRANSITION, objname,
+					     out_sid);
+}
+
+int kp_security_member_sid_clean(u32 ssid, u32 tsid, u16 tclass,
+				 u32 *out_sid)
+{
+	if (!kp_clean_policydb_valid)
+		return security_member_sid(ssid, tsid, tclass, out_sid);
+
+	return kp_security_compute_sid_clean(ssid, tsid, tclass,
+					     AVTAB_MEMBER, NULL, out_sid);
+}
+
+int kp_security_change_sid_clean(u32 ssid, u32 tsid, u16 tclass,
+				 u32 *out_sid)
+{
+	if (!kp_clean_policydb_valid)
+		return security_change_sid(ssid, tsid, tclass, out_sid);
+
+	return kp_security_compute_sid_clean(ssid, tsid, tclass,
+					     AVTAB_CHANGE, NULL, out_sid);
+}
+
 /**
  * security_transition_sid - Compute the SID for a new subject/object.
  * @ssid: source security identifier
@@ -2001,6 +2842,52 @@ static void security_load_policycaps(void)
 
 static int security_preserve_bools(struct policydb *p);
 
+static void kp_save_clean_policy(struct policydb *db)
+{
+	struct policy_file fp;
+	struct policy_file read_fp;
+	struct type_datum *typedatum;
+	char *buf;
+	size_t written;
+	int rc;
+
+	if (kp_clean_policydb_valid)
+		return;
+
+	if (!db->len)
+		return;
+
+	buf = vmalloc(db->len);
+	if (!buf)
+		return;
+
+	fp.data = buf;
+	fp.len = db->len;
+	read_lock(&policy_rwlock);
+	rc = policydb_write(db, &fp);
+	read_unlock(&policy_rwlock);
+	if (rc)
+		goto out;
+
+	written = fp.data - buf;
+	read_fp.data = buf;
+	read_fp.len = written;
+	rc = policydb_read(&kp_clean_policydb, &read_fp);
+	if (rc) {
+		policydb_destroy(&kp_clean_policydb);
+		memset(&kp_clean_policydb, 0, sizeof(kp_clean_policydb));
+		goto out;
+	}
+
+	kp_clean_policydb.len = written;
+	typedatum = hashtab_search(db->p_types.table, "app_zygote");
+	if (typedatum)
+		kp_app_zygote_type_value = typedatum->value;
+	kp_clean_policydb_valid = true;
+out:
+	vfree(buf);
+}
+
 /**
  * security_load_policy - Load a security policy configuration.
  * @data: binary policy data
@@ -2063,6 +2950,7 @@ int security_load_policy(void *data, size_t len)
 		selinux_status_update_policyload(seqno);
 		selinux_netlbl_cache_invalidate();
 		selinux_xfrm_notify_policyload();
+		kp_save_clean_policy(&policydb);
 		goto out;
 	}
 
