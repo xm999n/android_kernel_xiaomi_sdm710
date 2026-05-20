@@ -23,6 +23,7 @@
 #include <linux/init.h>
 #include <linux/string.h>
 #include <linux/security.h>
+#include <linux/cred.h>
 #include <linux/major.h>
 #include <linux/seq_file.h>
 #include <linux/percpu.h>
@@ -40,6 +41,11 @@
 #include "security.h"
 #include "objsec.h"
 #include "conditional.h"
+
+extern bool kp_caller_is_app_zygote(u32 caller_sid);
+extern void kp_security_compute_av_user_clean(u32 ssid, u32 tsid,
+					     u16 tclass,
+					     struct av_decision *avd);
 
 /* Policy capability filenames */
 static char *policycap_names[] = {
@@ -764,8 +770,9 @@ static const struct file_operations transaction_ops = {
 
 static ssize_t sel_write_access(struct file *file, char *buf, size_t size)
 {
+	const struct task_security_struct *tsec;
 	char *scon = NULL, *tcon = NULL;
-	u32 ssid, tsid;
+	u32 caller_sid, ssid, tsid;
 	u16 tclass;
 	struct av_decision avd;
 	ssize_t length;
@@ -796,7 +803,12 @@ static ssize_t sel_write_access(struct file *file, char *buf, size_t size)
 	if (length)
 		goto out;
 
-	security_compute_av_user(ssid, tsid, tclass, &avd);
+	tsec = current_security();
+	caller_sid = tsec->sid;
+	if (kp_caller_is_app_zygote(caller_sid))
+		kp_security_compute_av_user_clean(ssid, tsid, tclass, &avd);
+	else
+		security_compute_av_user(ssid, tsid, tclass, &avd);
 
 	length = scnprintf(buf, SIMPLE_TRANSACTION_LIMIT,
 			  "%x %x %x %x %u %x",

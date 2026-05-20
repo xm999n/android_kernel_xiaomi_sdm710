@@ -82,6 +82,10 @@ static struct sidtab sidtab;
 struct policydb policydb;
 int ss_initialized;
 
+static struct policydb kp_clean_policydb;
+static bool kp_clean_policydb_valid = false;
+static u32 kp_app_zygote_type_value = 0;
+
 /*
  * The largest sequence number that has been used when
  * providing an access decision to the access vector cache.
@@ -95,6 +99,13 @@ static int context_struct_to_string(struct context *context, char **scontext,
 				    u32 *scontext_len);
 
 static void context_struct_compute_av(struct context *scontext,
+					struct context *tcontext,
+					u16 tclass,
+					struct av_decision *avd,
+					struct extended_perms *xperms);
+
+static void kp_context_struct_compute_av(struct policydb *p,
+					struct context *scontext,
 					struct context *tcontext,
 					u16 tclass,
 					struct av_decision *avd,
@@ -592,6 +603,229 @@ static void type_attribute_bounds_av(struct context *scontext,
 				tclass, masked, "bounds");
 }
 
+static int kp_constraint_expr_eval(struct policydb *p,
+				   struct context *scontext,
+				   struct context *tcontext,
+				   struct context *xcontext,
+				   struct constraint_expr *cexpr)
+{
+	u32 val1, val2;
+	struct context *c;
+	struct role_datum *r1, *r2;
+	struct mls_level *l1, *l2;
+	struct constraint_expr *e;
+	int s[CEXPR_MAXDEPTH];
+	int sp = -1;
+
+	for (e = cexpr; e; e = e->next) {
+		switch (e->expr_type) {
+		case CEXPR_NOT:
+			BUG_ON(sp < 0);
+			s[sp] = !s[sp];
+			break;
+		case CEXPR_AND:
+			BUG_ON(sp < 1);
+			sp--;
+			s[sp] &= s[sp + 1];
+			break;
+		case CEXPR_OR:
+			BUG_ON(sp < 1);
+			sp--;
+			s[sp] |= s[sp + 1];
+			break;
+		case CEXPR_ATTR:
+			if (sp == (CEXPR_MAXDEPTH - 1))
+				return 0;
+			switch (e->attr) {
+			case CEXPR_USER:
+				val1 = scontext->user;
+				val2 = tcontext->user;
+				break;
+			case CEXPR_TYPE:
+				val1 = scontext->type;
+				val2 = tcontext->type;
+				break;
+			case CEXPR_ROLE:
+				val1 = scontext->role;
+				val2 = tcontext->role;
+				r1 = p->role_val_to_struct[val1 - 1];
+				r2 = p->role_val_to_struct[val2 - 1];
+				switch (e->op) {
+				case CEXPR_DOM:
+					s[++sp] = ebitmap_get_bit(&r1->dominates,
+								  val2 - 1);
+					continue;
+				case CEXPR_DOMBY:
+					s[++sp] = ebitmap_get_bit(&r2->dominates,
+								  val1 - 1);
+					continue;
+				case CEXPR_INCOMP:
+					s[++sp] = (!ebitmap_get_bit(&r1->dominates,
+								    val2 - 1) &&
+						   !ebitmap_get_bit(&r2->dominates,
+								    val1 - 1));
+					continue;
+				default:
+					break;
+				}
+				break;
+			case CEXPR_L1L2:
+				l1 = &(scontext->range.level[0]);
+				l2 = &(tcontext->range.level[0]);
+				goto mls_ops;
+			case CEXPR_L1H2:
+				l1 = &(scontext->range.level[0]);
+				l2 = &(tcontext->range.level[1]);
+				goto mls_ops;
+			case CEXPR_H1L2:
+				l1 = &(scontext->range.level[1]);
+				l2 = &(tcontext->range.level[0]);
+				goto mls_ops;
+			case CEXPR_H1H2:
+				l1 = &(scontext->range.level[1]);
+				l2 = &(tcontext->range.level[1]);
+				goto mls_ops;
+			case CEXPR_L1H1:
+				l1 = &(scontext->range.level[0]);
+				l2 = &(scontext->range.level[1]);
+				goto mls_ops;
+			case CEXPR_L2H2:
+				l1 = &(tcontext->range.level[0]);
+				l2 = &(tcontext->range.level[1]);
+				goto mls_ops;
+mls_ops:
+				switch (e->op) {
+				case CEXPR_EQ:
+					s[++sp] = mls_level_eq(l1, l2);
+					continue;
+				case CEXPR_NEQ:
+					s[++sp] = !mls_level_eq(l1, l2);
+					continue;
+				case CEXPR_DOM:
+					s[++sp] = mls_level_dom(l1, l2);
+					continue;
+				case CEXPR_DOMBY:
+					s[++sp] = mls_level_dom(l2, l1);
+					continue;
+				case CEXPR_INCOMP:
+					s[++sp] = mls_level_incomp(l2, l1);
+					continue;
+				default:
+					BUG();
+					return 0;
+				}
+				break;
+			default:
+				BUG();
+				return 0;
+			}
+
+			switch (e->op) {
+			case CEXPR_EQ:
+				s[++sp] = (val1 == val2);
+				break;
+			case CEXPR_NEQ:
+				s[++sp] = (val1 != val2);
+				break;
+			default:
+				BUG();
+				return 0;
+			}
+			break;
+		case CEXPR_NAMES:
+			if (sp == (CEXPR_MAXDEPTH-1))
+				return 0;
+			c = scontext;
+			if (e->attr & CEXPR_TARGET)
+				c = tcontext;
+			else if (e->attr & CEXPR_XTARGET) {
+				c = xcontext;
+				if (!c) {
+					BUG();
+					return 0;
+				}
+			}
+			if (e->attr & CEXPR_USER)
+				val1 = c->user;
+			else if (e->attr & CEXPR_ROLE)
+				val1 = c->role;
+			else if (e->attr & CEXPR_TYPE)
+				val1 = c->type;
+			else {
+				BUG();
+				return 0;
+			}
+
+			switch (e->op) {
+			case CEXPR_EQ:
+				s[++sp] = ebitmap_get_bit(&e->names, val1 - 1);
+				break;
+			case CEXPR_NEQ:
+				s[++sp] = !ebitmap_get_bit(&e->names, val1 - 1);
+				break;
+			default:
+				BUG();
+				return 0;
+			}
+			break;
+		default:
+			BUG();
+			return 0;
+		}
+	}
+
+	BUG_ON(sp != 0);
+	return s[0];
+}
+
+static void kp_type_attribute_bounds_av(struct policydb *p,
+					struct context *scontext,
+					struct context *tcontext,
+					u16 tclass,
+					struct av_decision *avd)
+{
+	struct context lo_scontext;
+	struct context lo_tcontext, *tcontextp = tcontext;
+	struct av_decision lo_avd;
+	struct type_datum *source;
+	struct type_datum *target;
+	u32 masked = 0;
+
+	source = flex_array_get_ptr(p->type_val_to_struct_array,
+				    scontext->type - 1);
+	BUG_ON(!source);
+
+	if (!source->bounds)
+		return;
+
+	target = flex_array_get_ptr(p->type_val_to_struct_array,
+				    tcontext->type - 1);
+	BUG_ON(!target);
+
+	memset(&lo_avd, 0, sizeof(lo_avd));
+
+	memcpy(&lo_scontext, scontext, sizeof(lo_scontext));
+	lo_scontext.type = source->bounds;
+
+	if (target->bounds) {
+		memcpy(&lo_tcontext, tcontext, sizeof(lo_tcontext));
+		lo_tcontext.type = target->bounds;
+		tcontextp = &lo_tcontext;
+	}
+
+	kp_context_struct_compute_av(p, &lo_scontext,
+				     tcontextp,
+				     tclass,
+				     &lo_avd,
+				     NULL);
+
+	masked = ~lo_avd.allowed & avd->allowed;
+	if (likely(!masked))
+		return;
+
+	avd->allowed &= ~masked;
+}
+
 /*
  * flag which drivers have permissions
  * only looking for ioctl based extended permssions
@@ -724,6 +958,89 @@ static void context_struct_compute_av(struct context *scontext,
 	 */
 	type_attribute_bounds_av(scontext, tcontext,
 				 tclass, avd);
+}
+
+static void kp_context_struct_compute_av(struct policydb *p,
+					struct context *scontext,
+					struct context *tcontext,
+					u16 tclass,
+					struct av_decision *avd,
+					struct extended_perms *xperms)
+{
+	struct constraint_node *constraint;
+	struct role_allow *ra;
+	struct avtab_key avkey;
+	struct avtab_node *node;
+	struct class_datum *tclass_datum;
+	struct ebitmap *sattr, *tattr;
+	struct ebitmap_node *snode, *tnode;
+	unsigned int i, j;
+
+	avd->allowed = 0;
+	avd->auditallow = 0;
+	avd->auditdeny = 0xffffffff;
+	if (xperms) {
+		memset(&xperms->drivers, 0, sizeof(xperms->drivers));
+		xperms->len = 0;
+	}
+
+	if (unlikely(!tclass || tclass > p->p_classes.nprim)) {
+		if (printk_ratelimit())
+			printk(KERN_WARNING "SELinux:  Invalid class %hu\n", tclass);
+		return;
+	}
+
+	tclass_datum = p->class_val_to_struct[tclass - 1];
+
+	avkey.target_class = tclass;
+	avkey.specified = AVTAB_AV | AVTAB_XPERMS;
+	sattr = flex_array_get(p->type_attr_map_array, scontext->type - 1);
+	BUG_ON(!sattr);
+	tattr = flex_array_get(p->type_attr_map_array, tcontext->type - 1);
+	BUG_ON(!tattr);
+	ebitmap_for_each_positive_bit(sattr, snode, i) {
+		ebitmap_for_each_positive_bit(tattr, tnode, j) {
+			avkey.source_type = i + 1;
+			avkey.target_type = j + 1;
+			for (node = avtab_search_node(&p->te_avtab, &avkey);
+			     node;
+			     node = avtab_search_node_next(node, avkey.specified)) {
+				if (node->key.specified == AVTAB_ALLOWED)
+					avd->allowed |= node->datum.u.data;
+				else if (node->key.specified == AVTAB_AUDITALLOW)
+					avd->auditallow |= node->datum.u.data;
+				else if (node->key.specified == AVTAB_AUDITDENY)
+					avd->auditdeny &= node->datum.u.data;
+				else if (xperms && (node->key.specified & AVTAB_XPERMS))
+					services_compute_xperms_drivers(xperms, node);
+			}
+
+			cond_compute_av(&p->te_cond_avtab, &avkey, avd, xperms);
+		}
+	}
+
+	constraint = tclass_datum->constraints;
+	while (constraint) {
+		if ((constraint->permissions & (avd->allowed)) &&
+		    !kp_constraint_expr_eval(p, scontext, tcontext, NULL,
+					    constraint->expr))
+			avd->allowed &= ~(constraint->permissions);
+		constraint = constraint->next;
+	}
+
+	if (tclass == p->process_class &&
+	    (avd->allowed & p->process_trans_perms) &&
+	    scontext->role != tcontext->role) {
+		for (ra = p->role_allow; ra; ra = ra->next) {
+			if (scontext->role == ra->role &&
+			    tcontext->role == ra->new_role)
+				break;
+		}
+		if (!ra)
+			avd->allowed &= ~p->process_trans_perms;
+	}
+
+	kp_type_attribute_bounds_av(p, scontext, tcontext, tclass, avd);
 }
 
 static int security_validtrans_handle_fail(struct context *ocontext,
@@ -1167,6 +1484,78 @@ void security_compute_av_user(u32 ssid,
 
 	context_struct_compute_av(scontext, tcontext, tclass, avd, NULL);
  out:
+	read_unlock(&policy_rwlock);
+	return;
+allow:
+	avd->allowed = 0xffffffff;
+	goto out;
+}
+
+bool kp_caller_is_app_zygote(u32 caller_sid)
+{
+	struct context *ctx;
+	bool ret = false;
+
+	if (!kp_clean_policydb_valid || !kp_app_zygote_type_value)
+		return false;
+
+	read_lock(&policy_rwlock);
+	ctx = sidtab_search(&sidtab, caller_sid);
+	ret = ctx && ctx->type == kp_app_zygote_type_value;
+	read_unlock(&policy_rwlock);
+
+	return ret;
+}
+
+void kp_security_compute_av_user_clean(u32 ssid,
+				       u32 tsid,
+				       u16 tclass,
+				       struct av_decision *avd)
+{
+	struct context *scontext = NULL, *tcontext = NULL;
+
+	if (!kp_clean_policydb_valid) {
+		security_compute_av_user(ssid, tsid, tclass, avd);
+		return;
+	}
+
+	read_lock(&policy_rwlock);
+	avd_init(avd);
+	if (!ss_initialized)
+		goto allow;
+
+	scontext = sidtab_search(&sidtab, ssid);
+	if (!scontext) {
+		printk(KERN_ERR "SELinux: %s:  unrecognized SID %d\n",
+		       __func__, ssid);
+		goto out;
+	}
+
+	if (scontext->type > kp_clean_policydb.p_types.nprim)
+		goto out;
+
+	if (ebitmap_get_bit(&kp_clean_policydb.permissive_map, scontext->type))
+		avd->flags |= AVD_FLAGS_PERMISSIVE;
+
+	tcontext = sidtab_search(&sidtab, tsid);
+	if (!tcontext) {
+		printk(KERN_ERR "SELinux: %s:  unrecognized SID %d\n",
+		       __func__, tsid);
+		goto out;
+	}
+
+	if (tcontext->type > kp_clean_policydb.p_types.nprim)
+		goto out;
+
+	if (unlikely(!tclass)) {
+		if (kp_clean_policydb.allow_unknown)
+			goto allow;
+		goto out;
+	}
+
+	kp_context_struct_compute_av(&kp_clean_policydb, scontext, tcontext,
+				     tclass, avd, NULL);
+out:
 	read_unlock(&policy_rwlock);
 	return;
 allow:
@@ -2001,6 +2390,52 @@ static void security_load_policycaps(void)
 
 static int security_preserve_bools(struct policydb *p);
 
+static void kp_save_clean_policy(struct policydb *db)
+{
+	struct policy_file fp;
+	struct policy_file read_fp;
+	struct type_datum *typedatum;
+	char *buf;
+	size_t written;
+	int rc;
+
+	if (kp_clean_policydb_valid)
+		return;
+
+	if (!db->len)
+		return;
+
+	buf = vmalloc(db->len);
+	if (!buf)
+		return;
+
+	fp.data = buf;
+	fp.len = db->len;
+	read_lock(&policy_rwlock);
+	rc = policydb_write(db, &fp);
+	read_unlock(&policy_rwlock);
+	if (rc)
+		goto out;
+
+	written = fp.data - buf;
+	read_fp.data = buf;
+	read_fp.len = written;
+	rc = policydb_read(&kp_clean_policydb, &read_fp);
+	if (rc) {
+		policydb_destroy(&kp_clean_policydb);
+		memset(&kp_clean_policydb, 0, sizeof(kp_clean_policydb));
+		goto out;
+	}
+
+	kp_clean_policydb.len = written;
+	typedatum = hashtab_search(db->p_types.table, "app_zygote");
+	if (typedatum)
+		kp_app_zygote_type_value = typedatum->value;
+	kp_clean_policydb_valid = true;
+out:
+	vfree(buf);
+}
+
 /**
  * security_load_policy - Load a security policy configuration.
  * @data: binary policy data
@@ -2063,6 +2498,7 @@ int security_load_policy(void *data, size_t len)
 		selinux_status_update_policyload(seqno);
 		selinux_netlbl_cache_invalidate();
 		selinux_xfrm_notify_policyload();
+		kp_save_clean_policy(&policydb);
 		goto out;
 	}
 
