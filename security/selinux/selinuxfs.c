@@ -46,6 +46,21 @@ extern bool kp_caller_is_app_zygote(u32 caller_sid);
 extern void kp_security_compute_av_user_clean(u32 ssid, u32 tsid,
 					     u16 tclass,
 					     struct av_decision *avd);
+extern int kp_security_transition_sid_user_clean(u32 ssid, u32 tsid,
+						 u16 tclass,
+						 const char *objname,
+						 u32 *out_sid);
+extern int kp_security_member_sid_clean(u32 ssid, u32 tsid, u16 tclass,
+					u32 *out_sid);
+extern int kp_security_change_sid_clean(u32 ssid, u32 tsid, u16 tclass,
+					u32 *out_sid);
+
+static bool kp_current_is_app_zygote(void)
+{
+	const struct task_security_struct *tsec = current_security();
+
+	return kp_caller_is_app_zygote(tsec->sid);
+}
 
 /* Policy capability filenames */
 static char *policycap_names[] = {
@@ -430,6 +445,9 @@ static ssize_t sel_read_policy(struct file *filp, char __user *buf,
 {
 	struct policy_load_memory *plm = filp->private_data;
 	int ret;
+
+	if (kp_current_is_app_zygote())
+		return -EACCES;
 
 	mutex_lock(&sel_mutex);
 
@@ -894,8 +912,14 @@ static ssize_t sel_write_create(struct file *file, char *buf, size_t size)
 	if (length)
 		goto out;
 
-	length = security_transition_sid_user(ssid, tsid, tclass,
-					      objname, &newsid);
+	if (kp_current_is_app_zygote())
+		length = kp_security_transition_sid_user_clean(ssid, tsid,
+							       tclass,
+							       objname,
+							       &newsid);
+	else
+		length = security_transition_sid_user(ssid, tsid, tclass,
+						      objname, &newsid);
 	if (length)
 		goto out;
 
@@ -955,7 +979,11 @@ static ssize_t sel_write_relabel(struct file *file, char *buf, size_t size)
 	if (length)
 		goto out;
 
-	length = security_change_sid(ssid, tsid, tclass, &newsid);
+	if (kp_current_is_app_zygote())
+		length = kp_security_change_sid_clean(ssid, tsid, tclass,
+						      &newsid);
+	else
+		length = security_change_sid(ssid, tsid, tclass, &newsid);
 	if (length)
 		goto out;
 
@@ -1071,7 +1099,11 @@ static ssize_t sel_write_member(struct file *file, char *buf, size_t size)
 	if (length)
 		goto out;
 
-	length = security_member_sid(ssid, tsid, tclass, &newsid);
+	if (kp_current_is_app_zygote())
+		length = kp_security_member_sid_clean(ssid, tsid, tclass,
+						      &newsid);
+	else
+		length = security_member_sid(ssid, tsid, tclass, &newsid);
 	if (length)
 		goto out;
 

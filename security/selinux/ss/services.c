@@ -1782,6 +1782,46 @@ out:
 	return rc;
 }
 
+static u32 kp_current_sid(void)
+{
+	const struct task_security_struct *tsec = current_security();
+
+	return tsec->sid;
+}
+
+static int kp_clean_context_type_valid(char *scontext)
+{
+	struct type_datum *typdatum;
+	char *type, *end;
+	char saved;
+	int colons = 0;
+
+	type = scontext;
+	while (*type && colons < 2) {
+		if (*type == ':')
+			colons++;
+		type++;
+	}
+	if (colons < 2 || !*type)
+		return -EINVAL;
+
+	end = type;
+	while (*end && *end != ':')
+		end++;
+	if (end == type)
+		return -EINVAL;
+
+	saved = *end;
+	*end = '\0';
+	typdatum = hashtab_search(kp_clean_policydb.p_types.table, type);
+	*end = saved;
+
+	if (!typdatum || typdatum->attribute)
+		return -EINVAL;
+
+	return 0;
+}
+
 static int security_context_to_sid_core(const char *scontext, u32 scontext_len,
 					u32 *sid, u32 def_sid, gfp_t gfp_flags,
 					int force)
@@ -1818,6 +1858,12 @@ static int security_context_to_sid_core(const char *scontext, u32 scontext_len,
 		rc = -ENOMEM;
 		str = kstrdup(scontext2, gfp_flags);
 		if (!str)
+			goto out;
+	}
+
+	if (kp_clean_policydb_valid && kp_caller_is_app_zygote(kp_current_sid())) {
+		rc = kp_clean_context_type_valid(scontext2);
+		if (rc)
 			goto out;
 	}
 
@@ -2121,6 +2167,254 @@ out_unlock:
 	context_destroy(&newcontext);
 out:
 	return rc;
+}
+
+static int kp_mls_compute_sid(struct policydb *p,
+			      struct context *scontext,
+			      struct context *tcontext,
+			      u16 tclass,
+			      u32 specified,
+			      struct context *newcontext,
+			      bool sock)
+{
+	struct range_trans rtr;
+	struct mls_range *r;
+	struct class_datum *cladatum;
+	int default_range = 0;
+
+	if (!p->mls_enabled)
+		return 0;
+
+	switch (specified) {
+	case AVTAB_TRANSITION:
+		rtr.source_type = scontext->type;
+		rtr.target_type = tcontext->type;
+		rtr.target_class = tclass;
+		r = hashtab_search(p->range_tr, &rtr);
+		if (r)
+			return mls_range_set(newcontext, r);
+
+		if (tclass && tclass <= p->p_classes.nprim) {
+			cladatum = p->class_val_to_struct[tclass - 1];
+			if (cladatum)
+				default_range = cladatum->default_range;
+		}
+
+		switch (default_range) {
+		case DEFAULT_SOURCE_LOW:
+			return mls_context_cpy_low(newcontext, scontext);
+		case DEFAULT_SOURCE_HIGH:
+			return mls_context_cpy_high(newcontext, scontext);
+		case DEFAULT_SOURCE_LOW_HIGH:
+			return mls_context_cpy(newcontext, scontext);
+		case DEFAULT_TARGET_LOW:
+			return mls_context_cpy_low(newcontext, tcontext);
+		case DEFAULT_TARGET_HIGH:
+			return mls_context_cpy_high(newcontext, tcontext);
+		case DEFAULT_TARGET_LOW_HIGH:
+			return mls_context_cpy(newcontext, tcontext);
+		}
+
+		/* Fallthrough */
+	case AVTAB_CHANGE:
+		if ((tclass == p->process_class) || (sock == true))
+			return mls_context_cpy(newcontext, scontext);
+		else
+			return mls_context_cpy_low(newcontext, scontext);
+	case AVTAB_MEMBER:
+		return mls_context_cpy_low(newcontext, scontext);
+	}
+
+	return -EINVAL;
+}
+
+static int kp_compute_sid_handle_invalid_context(void)
+{
+	if (!selinux_enforcing)
+		return 0;
+	return -EACCES;
+}
+
+static int kp_security_compute_sid_clean(u32 ssid,
+					 u32 tsid,
+					 u16 orig_tclass,
+					 u32 specified,
+					 const char *objname,
+					 u32 *out_sid)
+{
+	struct policydb *p = &kp_clean_policydb;
+	struct class_datum *cladatum = NULL;
+	struct context *scontext = NULL, *tcontext = NULL, newcontext;
+	struct role_trans *roletr = NULL;
+	struct avtab_key avkey;
+	struct avtab_datum *avdatum;
+	struct avtab_node *node;
+	u16 tclass = orig_tclass;
+	int rc = 0;
+	bool sock;
+
+	if (!kp_clean_policydb_valid)
+		return -EINVAL;
+
+	if (!ss_initialized) {
+		switch (orig_tclass) {
+		case SECCLASS_PROCESS:
+			*out_sid = ssid;
+			break;
+		default:
+			*out_sid = tsid;
+			break;
+		}
+		return 0;
+	}
+
+	context_init(&newcontext);
+
+	read_lock(&policy_rwlock);
+
+	sock = security_is_socket_class(map_class(tclass));
+
+	scontext = sidtab_search(&sidtab, ssid);
+	if (!scontext) {
+		printk(KERN_ERR "SELinux: %s:  unrecognized SID %d\n",
+		       __func__, ssid);
+		rc = -EINVAL;
+		goto out_unlock;
+	}
+	tcontext = sidtab_search(&sidtab, tsid);
+	if (!tcontext) {
+		printk(KERN_ERR "SELinux: %s:  unrecognized SID %d\n",
+		       __func__, tsid);
+		rc = -EINVAL;
+		goto out_unlock;
+	}
+
+	if (scontext->type > p->p_types.nprim ||
+	    tcontext->type > p->p_types.nprim) {
+		rc = -EINVAL;
+		goto out_unlock;
+	}
+
+	if (tclass && tclass <= p->p_classes.nprim)
+		cladatum = p->class_val_to_struct[tclass - 1];
+
+	switch (specified) {
+	case AVTAB_TRANSITION:
+	case AVTAB_CHANGE:
+		if (cladatum && cladatum->default_user == DEFAULT_TARGET)
+			newcontext.user = tcontext->user;
+		else
+			newcontext.user = scontext->user;
+		break;
+	case AVTAB_MEMBER:
+		newcontext.user = tcontext->user;
+		break;
+	}
+
+	if (cladatum && cladatum->default_role == DEFAULT_SOURCE) {
+		newcontext.role = scontext->role;
+	} else if (cladatum && cladatum->default_role == DEFAULT_TARGET) {
+		newcontext.role = tcontext->role;
+	} else {
+		if ((tclass == p->process_class) || (sock == true))
+			newcontext.role = scontext->role;
+		else
+			newcontext.role = OBJECT_R_VAL;
+	}
+
+	if (cladatum && cladatum->default_type == DEFAULT_SOURCE) {
+		newcontext.type = scontext->type;
+	} else if (cladatum && cladatum->default_type == DEFAULT_TARGET) {
+		newcontext.type = tcontext->type;
+	} else {
+		if ((tclass == p->process_class) || (sock == true))
+			newcontext.type = scontext->type;
+		else
+			newcontext.type = tcontext->type;
+	}
+
+	avkey.source_type = scontext->type;
+	avkey.target_type = tcontext->type;
+	avkey.target_class = tclass;
+	avkey.specified = specified;
+	avdatum = avtab_search(&p->te_avtab, &avkey);
+
+	if (!avdatum) {
+		node = avtab_search_node(&p->te_cond_avtab, &avkey);
+		for (; node; node = avtab_search_node_next(node, specified)) {
+			if (node->key.specified & AVTAB_ENABLED) {
+				avdatum = &node->datum;
+				break;
+			}
+		}
+	}
+
+	if (avdatum)
+		newcontext.type = avdatum->u.data;
+
+	if (objname)
+		filename_compute_type(p, &newcontext, scontext->type,
+				      tcontext->type, tclass, objname);
+
+	if (specified & AVTAB_TRANSITION) {
+		for (roletr = p->role_tr; roletr; roletr = roletr->next) {
+			if ((roletr->role == scontext->role) &&
+			    (roletr->type == tcontext->type) &&
+			    (roletr->tclass == tclass)) {
+				newcontext.role = roletr->new_role;
+				break;
+			}
+		}
+	}
+
+	rc = kp_mls_compute_sid(p, scontext, tcontext, tclass, specified,
+				&newcontext, sock);
+	if (rc)
+		goto out_unlock;
+
+	if (!policydb_context_isvalid(p, &newcontext)) {
+		rc = kp_compute_sid_handle_invalid_context();
+		if (rc)
+			goto out_unlock;
+	}
+
+	rc = sidtab_context_to_sid(&sidtab, &newcontext, out_sid);
+out_unlock:
+	read_unlock(&policy_rwlock);
+	context_destroy(&newcontext);
+	return rc;
+}
+
+int kp_security_transition_sid_user_clean(u32 ssid, u32 tsid, u16 tclass,
+					  const char *objname, u32 *out_sid)
+{
+	if (!kp_clean_policydb_valid)
+		return security_transition_sid_user(ssid, tsid, tclass,
+						    objname, out_sid);
+
+	return kp_security_compute_sid_clean(ssid, tsid, tclass,
+					     AVTAB_TRANSITION, objname,
+					     out_sid);
+}
+
+int kp_security_member_sid_clean(u32 ssid, u32 tsid, u16 tclass,
+				 u32 *out_sid)
+{
+	if (!kp_clean_policydb_valid)
+		return security_member_sid(ssid, tsid, tclass, out_sid);
+
+	return kp_security_compute_sid_clean(ssid, tsid, tclass,
+					     AVTAB_MEMBER, NULL, out_sid);
+}
+
+int kp_security_change_sid_clean(u32 ssid, u32 tsid, u16 tclass,
+				 u32 *out_sid)
+{
+	if (!kp_clean_policydb_valid)
+		return security_change_sid(ssid, tsid, tclass, out_sid);
+
+	return kp_security_compute_sid_clean(ssid, tsid, tclass,
+					     AVTAB_CHANGE, NULL, out_sid);
 }
 
 /**
