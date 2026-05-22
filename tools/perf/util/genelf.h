@@ -43,19 +43,20 @@ int jit_add_debug_info(Elf *e, uint64_t code_addr, void *debug, int nr_debug_ent
 #define Elf_Ehdr	Elf64_Ehdr
 #define Elf_Shdr	Elf64_Shdr
 #define Elf_Sym		Elf64_Sym
-#define ELF_ST_TYPE(a)	ELF64_ST_TYPE(a)
-#define ELF_ST_BIND(a)	ELF64_ST_BIND(a)
-#define ELF_ST_VIS(a)	ELF64_ST_VISIBILITY(a)
 #else
 #define elf_newehdr	elf32_newehdr
 #define elf_getshdr	elf32_getshdr
 #define Elf_Ehdr	Elf32_Ehdr
 #define Elf_Shdr	Elf32_Shdr
 #define Elf_Sym		Elf32_Sym
-#define ELF_ST_TYPE(a)	ELF32_ST_TYPE(a)
-#define ELF_ST_BIND(a)	ELF32_ST_BIND(a)
-#define ELF_ST_VIS(a)	ELF32_ST_VISIBILITY(a)
 #endif
+
+#undef ELF_ST_TYPE
+#undef ELF_ST_BIND
+#undef ELF_ST_VIS
+#define ELF_ST_TYPE(a)	((a) & 0xf)
+#define ELF_ST_BIND(a)	((a) << 4)
+#define ELF_ST_VIS(a)	((a) & 0x3)
 
 /* The .text section is directly after the ELF header */
 #define GEN_ELF_TEXT_OFFSET sizeof(Elf_Ehdr)
