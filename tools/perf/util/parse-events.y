@@ -15,6 +15,9 @@
 #include "parse-events.h"
 #include "parse-events-bison.h"
 
+void parse_events_error(YYLTYPE *loc, void *data, void *scanner,
+			char const *msg);
+
 #define ABORT_ON(val) \
 do { \
 	if (val) \

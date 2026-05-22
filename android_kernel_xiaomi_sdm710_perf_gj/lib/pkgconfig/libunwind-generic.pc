@@ -1,0 +1,11 @@
+prefix=/home/user/gj/android_kernel_xiaomi_sdm710/android_kernel_xiaomi_sdm710_perf_gj
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: libunwind-generic
+Description: libunwind generic library
+Version: 1.8.1
+Requires: libunwind
+Libs: -L${libdir} -lunwind-generic
+Cflags: -I${includedir}

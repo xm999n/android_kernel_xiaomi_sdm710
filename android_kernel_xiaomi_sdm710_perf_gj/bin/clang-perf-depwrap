@@ -1,0 +1,53 @@
+#!/usr/bin/env sh
+set -eu
+
+if [ -n "${NDK_BIN:-}" ]; then
+	ndk_bin=$NDK_BIN
+elif [ -n "${NDK:-}" ]; then
+	ndk_bin=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin
+else
+	ndk_bin=/home/user/android-studio-2025.1.1.14/Android/Sdk/ndk/25.1.8937393/toolchains/llvm/prebuilt/linux-x86_64/bin
+fi
+name=${0##*/}
+
+case "$name" in
+	*++*) real="$ndk_bin/aarch64-linux-android24-clang++" ;;
+	*) real="$ndk_bin/aarch64-linux-android24-clang" ;;
+esac
+
+depfiles=
+for arg in "$@"; do
+	case "$arg" in
+		-Wp,-MD,*|-Wp,-MMD,*)
+			rest=${arg#-Wp,}
+			rest=${rest#-MD,}
+			rest=${rest#-MMD,}
+			dep=${rest%%,*}
+			depfiles="$depfiles
+$dep"
+			;;
+	esac
+done
+
+"$real" "$@"
+status=$?
+
+if [ "$status" -eq 0 ]; then
+	printf '%s\n' "$depfiles" | while IFS= read -r dep; do
+		[ -n "$dep" ] || continue
+		[ -f "$dep" ] && continue
+
+		dir=${dep%/*}
+		base=${dep##*/}
+		case "$base" in
+			.*.o.d)
+				stem=${base#.}
+				stem=${stem%.o.d}
+				candidate="$dir/$stem.d"
+				[ -f "$candidate" ] && cp "$candidate" "$dep"
+				;;
+		esac
+	done
+fi
+
+exit "$status"
