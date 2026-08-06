@@ -1,0 +1,227 @@
+name: Build v4l2-ctl for Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      v4l_utils_ref:
+        description: 'v4l-utils tag/branch/commit (default: master)'
+        required: false
+        default: 'master'
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a, x86_64, x86]
+
+    env:
+      V4L_REF: ${{ github.event.inputs.v4l_utils_ref || 'master' }}
+      API_LEVEL: '24'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${ANDROID_NDK_HOME:-}" && -f "${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" ]]; then
+            echo "NDK_PATH=${ANDROID_NDK_HOME}" >> "$GITHUB_ENV"
+          else
+            ndk_dir=$(ls -d /usr/local/lib/android/sdk/ndk/* 2>/dev/null | sort -V | tail -1)
+            if [[ -z "$ndk_dir" ]]; then
+              echo "::error::Android NDK not found"
+              exit 1
+            fi
+            echo "NDK_PATH=$ndk_dir" >> "$GITHUB_ENV"
+          fi
+
+      - name: Clone upstream v4l-utils
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone https://github.com/gjasny/v4l-utils.git v4l-utils
+          cd v4l-utils
+          if [[ "$V4L_REF" != "master" ]]; then
+            git fetch origin "$V4L_REF"
+            git checkout FETCH_HEAD
+          fi
+          echo "::notice::Building v4l-utils @ $(git rev-parse --short HEAD)"
+
+      - name: Prepare Build Files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p v4l-utils/android-build
+          cat > v4l-utils/android-build/CMakeLists.txt << 'EOF'
+          cmake_minimum_required(VERSION 3.10)
+          project(v4l2-ctl C CXX)
+
+          get_filename_component(SRC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+          set(V4L2_CTL_DIR   "${SRC_ROOT}/utils/v4l2-ctl")
+          set(COMMON_DIR     "${SRC_ROOT}/utils/common")
+          set(INCLUDE_DIR    "${SRC_ROOT}/include")
+          set(GENERATED_DIR  "${CMAKE_BINARY_DIR}/generated")
+          file(MAKE_DIRECTORY "${GENERATED_DIR}")
+
+          # ---- 配置阶段生成所需头文件 ----
+          # 1. 提取版本号
+          file(STRINGS "${SRC_ROOT}/meson.build" MESON_VERSION REGEX "version: '[0-9.]+'")
+          if(MESON_VERSION)
+              string(REGEX MATCH "[0-9.]+" V4L_VERSION "${MESON_VERSION}")
+          else()
+              set(V4L_VERSION "1.33.0")
+          endif()
+
+          # 2. 生成 media-bus-format-names.h (直接 execute_process)
+          find_program(BASH_PROG bash REQUIRED)
+          set(MEDIA_BUS_FMT_H "${INCLUDE_DIR}/linux/media-bus-format.h")
+          set(NAMES_H "${GENERATED_DIR}/media-bus-format-names.h")
+          execute_process(
+              COMMAND "${BASH_PROG}" "${SRC_ROOT}/utils/gen_media_bus_format_names.sh" "${MEDIA_BUS_FMT_H}"
+              OUTPUT_FILE "${NAMES_H}"
+              RESULT_VARIABLE _gen_ret
+          )
+          if(NOT _gen_ret EQUAL 0)
+              message(FATAL_ERROR "Failed to generate media-bus-format-names.h")
+          endif()
+
+          # 3. 获取 git 信息
+          execute_process(COMMAND git -C "${SRC_ROOT}" rev-parse --short=12 HEAD
+              OUTPUT_VARIABLE GIT_SHA OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+          if(NOT GIT_SHA)
+              set(GIT_SHA "unknown")
+          endif()
+          execute_process(COMMAND git -C "${SRC_ROOT}" rev-list --count HEAD
+              OUTPUT_VARIABLE GIT_CNT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+          if(NOT GIT_CNT)
+              set(GIT_CNT "0")
+          endif()
+          execute_process(COMMAND git -C "${SRC_ROOT}" show --quiet --date=format-local:%F\ %T --format=%cd
+              OUTPUT_VARIABLE GIT_DATE OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+          if(NOT GIT_DATE)
+              set(GIT_DATE "unknown")
+          endif()
+
+          set(CONFIG_H "${GENERATED_DIR}/android-config.h")
+          file(WRITE "${CONFIG_H}"
+          "/* Auto-generated config for Android */\n"
+          "#ifndef ANDROID_CONFIG_H\n#define ANDROID_CONFIG_H\n\n"
+          "#define PACKAGE \"v4l-utils\"\n"
+          "#define PACKAGE_VERSION \"${V4L_VERSION}\"\n"
+          "#define V4L_UTILS_VERSION \"${V4L_VERSION}\"\n"
+          "#define GIT_SHA \"${GIT_SHA}\"\n"
+          "#define GIT_COMMIT_CNT \"-${GIT_CNT}\"\n"
+          "#define GIT_COMMIT_DATE \"${GIT_DATE}\"\n\n"
+          "#endif\n")
+
+          # ---- 编译选项 ----
+          add_compile_definitions(NO_LIBV4L2)
+          add_compile_options(-fvisibility=hidden -Wall -Wno-unused-parameter)
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+          include_directories(
+              "${INCLUDE_DIR}"
+              "${COMMON_DIR}"
+              "${V4L2_CTL_DIR}"
+              "${GENERATED_DIR}"
+          )
+          add_compile_options("-include" "${CONFIG_H}")
+
+          # ---- 源文件 ----
+          set(V4L2_CTL_SOURCES
+              "${V4L2_CTL_DIR}/v4l2-ctl.cpp"
+              "${V4L2_CTL_DIR}/v4l2-ctl-common.cpp"
+              "${V4L2_CTL_DIR}/v4l2-ctl-tuner.cpp"
+              "${V4L2_CTL_DIR}/v4l2-ctl-io.cpp"
+              "${V4L2_CTL_DIR}/v4l2-ctl-stds.cpp"
+              "${V4L2_CTL_DIR}/v4l2-ctl-vidcap.cpp"
+              "${V4L2_CTL_DIR}/v4l2-ctl-vidout.cpp"
+              "${V4L2_CTL_DIR}/v4l2-ctl-overlay.cpp"
+              "${V4L2_CTL_DIR}/v4l2-ctl-vbi.cpp"
+              "${V4L2_CTL_DIR}/v4l2-ctl-selection.cpp"
+              "${V4L2_CTL_DIR}/v4l2-ctl-misc.cpp"
+              "${V4L2_CTL_DIR}/v4l2-ctl-streaming.cpp"
+              "${V4L2_CTL_DIR}/v4l2-ctl-sdr.cpp"
+              "${V4L2_CTL_DIR}/v4l2-ctl-edid.cpp"
+              "${V4L2_CTL_DIR}/v4l2-ctl-modes.cpp"
+              "${V4L2_CTL_DIR}/v4l2-ctl-meta.cpp"
+              "${V4L2_CTL_DIR}/v4l2-ctl-subdev.cpp"
+              "${COMMON_DIR}/v4l2-tpg-core.c"
+              "${COMMON_DIR}/v4l2-tpg-colors.c"
+              "${COMMON_DIR}/v4l2-info.cpp"
+              "${COMMON_DIR}/v4l-stream.c"
+              "${COMMON_DIR}/media-info.cpp"
+              "${COMMON_DIR}/codec-v4l2-fwht.c"
+              "${COMMON_DIR}/codec-fwht.c"
+          )
+
+          # ---- 链接 ----
+          find_library(LOG_LIB log)
+          add_executable(v4l2-ctl ${V4L2_CTL_SOURCES})
+          if(LOG_LIB)
+              target_link_libraries(v4l2-ctl ${LOG_LIB})
+          endif()
+          EOF
+
+      - name: Build v4l2-ctl (${{ matrix.abi }})
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd v4l-utils/android-build
+          cmake -B build \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_PATH/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="${{ matrix.abi }}" \
+            -DANDROID_PLATFORM="android-$API_LEVEL" \
+            -DANDROID_STL="c++_static" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j$(nproc)
+
+      - name: Strip and collect
+        shell: bash
+        run: |
+          set -euo pipefail
+          STRIP="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          mkdir -p out
+          BIN="v4l-utils/android-build/build/v4l2-ctl"
+          ABI="${{ matrix.abi }}"
+          cp "$BIN" "out/v4l2-ctl-$ABI"
+          "$STRIP" --strip-debug "out/v4l2-ctl-$ABI"
+          chmod 755 "out/v4l2-ctl-$ABI"
+          cp "$BIN" "out/v4l2-ctl-$ABI.debug"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: v4l2-ctl-${{ matrix.abi }}
+          path: out/v4l2-ctl-*
+          retention-days: 7
+
+  bundle:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: bundle
+          merge-multiple: true
+      - name: Repackage
+        run: |
+          mkdir -p final
+          cp -v bundle/v4l2-ctl-* final/
+          rm -f final/*.debug
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: v4l2-ctl-android-all-abis
+          path: final/*
