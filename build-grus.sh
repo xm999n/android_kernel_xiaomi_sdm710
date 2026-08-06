@@ -97,12 +97,17 @@ cp "$CONFIG_SOURCE" "$OUT_DIR/.config"
 
 echo "== v4l2loopback source =="
 # drivers/Makefile references drivers/virtual_camera via obj-y; ensure the
-# directory exists before kbuild scans it. In CI the checkout won't have it
-# (it's an independent repo), so clone upstream when missing.
+# directory exists before kbuild scans it. The vendored copy in the tree is
+# used for local builds; in CI ($CI set, e.g. GitHub Actions) we always
+# refresh from upstream main to track the latest v4l2loopback.
 VC_DIR="$ROOT_DIR/drivers/virtual_camera"
-if [[ ! -f "$VC_DIR/v4l2loopback.c" ]]; then
+VC_REPO="https://github.com/umlaeute/v4l2loopback.git"
+if [[ -n "${CI:-}" ]]; then
   rm -rf "$VC_DIR"
-  git clone --depth 1 https://github.com/umlaeute/v4l2loopback.git "$VC_DIR"
+  git clone --depth 1 "$VC_REPO" "$VC_DIR"
+elif [[ ! -f "$VC_DIR/v4l2loopback.c" ]]; then
+  rm -rf "$VC_DIR"
+  git clone --depth 1 "$VC_REPO" "$VC_DIR"
 else
   echo "v4l2loopback source already present, skipping clone"
 fi
