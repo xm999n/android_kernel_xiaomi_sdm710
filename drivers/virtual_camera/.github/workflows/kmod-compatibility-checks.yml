@@ -1,0 +1,239 @@
+---
+name: kmod compatibility checks
+on:
+  pull_request:
+    branches:
+      - develop
+      - main
+  push:
+    branches:
+      - develop
+      - main
+  schedule:
+    - cron: '37 5 * * 1'
+
+jobs:
+  get_distro_releases:
+    runs-on: ubuntu-latest
+    steps:
+      - name: install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install curl jq
+      - name: calculate available releases
+        # the following does:
+        # - fetch all available tags for the "buildpack-deps" Docker image
+        # - fetch all available Ubuntu and Debian releases (that are still hosted on the distros' archive servers)
+        # -   Debian releases are actually hardcoded to their suite names
+        # - get the intersection of the tags and the releases
+        # - drop some blacklisted releases (e.g. 'bionic', 'xenial')
+        # - format as a JSON array
+        run: |
+          ubuntu_blacklist="bionic|xenial"
+          # debian (hardcoded)
+          debimages="unstable testing stable oldstable"
+          # ubuntu (based on availability)
+          debimages="${debimages} $(true; (curl -s "https://hub.docker.com/v2/repositories/library/buildpack-deps/tags?page_size=1000" | jq -r '.results[] | .name' | sort -u; curl -s "http://archive.ubuntu.com/ubuntu/dists/" | grep "href=" | sed -e 's|.*a href="||' -e 's|".*||' -e 's|/$||') | sort | uniq -d | grep -vE "^(${ubuntu_blacklist})$")"
+
+          # last 5 fedora images
+          fedversions="$(curl -s "https://hub.docker.com/v2/repositories/library/fedora/tags?page_size=20" | jq -r '.results[] | .name' | sort -u | egrep "^[0-9]*$" | sort -n | tail -5)"
+
+          # make images
+          images=""
+          # Debian: prefix deb-images with 'buildpack-deps:'
+          images="$(for i in ${debimages}; do echo "${i} buildpack-deps:${i}"; done) ${images}"
+          # Fedora
+          images="$(for i in ${fedversions}; do echo "fedora${i} fedora:${i}"; done) ${images}"
+
+          # more images in name/container pairs
+          images="alpine openebs/alpine-bash archlinux archlinux:base-devel tumbleweed opensuse/tumbleweed ${images}"
+
+          # create a JSON matrix
+          echo matrix=$(echo ${images} | xargs -n2 echo | jq -Rn '{include: [inputs] | map( split(" ") | { name:.[0], image:.[1] } )}') | tee -a ${GITHUB_OUTPUT}
+        id: set-matrix
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+
+  kmod-compile:
+    runs-on: ubuntu-latest
+    needs: get_distro_releases
+    strategy:
+      matrix: ${{ fromJson(needs.get_distro_releases.outputs.matrix) }}
+      fail-fast: false
+    container: ${{ matrix.image }}
+    env:
+      JOB_KNOWN_FAILURES: "3.13 3.16 3.19 4.2"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compile against all available kernel header versions
+        shell: bash
+        run: |
+          echo "name '${{ matrix.name }}' on image '${{ matrix.image }}'"
+
+          # Debian and derivatives
+          not_apt=true; if which apt-get >/dev/null 2>/dev/null; then not_apt=false; fi
+          ${not_apt} || echo "running apt-based distribution (Debian and derivatives)"
+          deb_packages="kmod dkms lsb-release dctrl-tools linux-headers-generic linux-headers"
+          ${not_apt} || apt-get update --quiet
+          ${not_apt} || apt-cache show ${deb_packages} \
+                | sed -e '/^Package:/!d' -e 's|^Package:[[:space:]]*||' | sort -u \
+                | xargs apt-get install --yes --no-install-recommends || true
+          ${not_apt} || grep-aptavail -n -s Package  -F Provides -X linux-headers -o -F Provides -X linux-headers-generic \
+                | xargs apt-get install --yes --no-install-recommends || true
+          ${not_apt} || apt-cache search "linux-headers-[0-9.]*-[0-9]*-" | cut -d " " -f1 \
+                | sed -e 's|linux-headers-\([0-9.]*\)-[0-9]*-\(.*\)|\0 \1 \2|' | sort -t- -k3,4 -V -r | sort  -u -k2,3 -V | cut -d " " -f1 \
+                | xargs apt-get install --yes --no-install-recommends || true
+
+          # Alpine
+          not_apkg=true; if which apk >/dev/null 2>/dev/null; then not_apkg=false; fi
+          ${not_apkg} || echo "running apk-based distribution (Alpine,...)"
+          ${not_apkg} || apk add lsb-release build-base linux-headers linux-firmware-none
+          ${not_apkg} || apk search "linux-*-dev" | grep "^linux" | sed -e 's|-dev-.*|-dev|' | xargs -n1 apk add
+          ${not_apkg} || JOB_KNOWN_FAILURES="${JOB_KNOWN_FAILURES} 6.15.0-0-edge"
+
+          # Fedora
+          not_dnf5=true; if dnf5 --version >/dev/null; then not_dnf5=false; fi
+          ${not_dnf5} || echo "running dnf5-based distribution (Fedora>=41,...)"
+          ${not_dnf5} || dnf5 upgrade -y --refresh
+          ${not_dnf5} || dnf5 install -y --setopt=install_weak_deps=False --skip-unavailable lsb-release dkms kernel-devel kernel-headers kernel-modules-core || dnf5 install -y --setopt=install_weak_deps=False --skip-unavailable lsb-release dkms kernel-devel kernel-headers kernel-modules-cor
+          not_dnf=true; if ${not_dnf5} && dnf --version>/dev/null; then not_dnf=false; fi
+          ${not_dnf} || echo "running dnf-based distribution (Fedora<41,...)"
+          ${not_dnf} || dnf upgrade -y --refresh
+          ${not_dnf} || dnf install -y --setopt=install_weak_deps=False lsb-release dkms kernel-devel kernel-headers kernel-modules-core
+
+          # openSUSE
+          not_zypper=true; if zypper --version >/dev/null; then not_zypper=false; fi
+          ${not_zypper} || echo "running zypper-based distribution (openSUSE,...)"
+          ${not_zypper} || zypper update --no-confirm
+          ${not_zypper} || zypper --ignore-unknown install --no-confirm --no-recommends dkms lsb-release  kernel-devel
+
+          # Arch
+          not_pacman=true; if pacman --version >/dev/null; then not_pacman=false; fi
+          ${not_pacman} || echo "running pacman-based distribution (ArchLinux,...)"
+          ${not_pacman} || pacman --noconfirm -Suy dkms lsb-release
+          ${not_pacman} || pacman -Si dkms | sed -n '/^Optional/{ s/[^:]*: //;:a;s/:.*//p;n;/^[^ \t]/q;ba;}' | sort -u | xargs pacman -S --noconfirm
+
+          # run the actual builds
+          lsb_release -a
+          failed=""
+          soft_failed=""
+          succeeded=""
+          skipped=""
+          for kbuild in /lib/modules/*/build; do
+            test -d $kbuild || continue
+            kver=${kbuild%/build}
+            kver=${kver##*/}
+            echo "=== Preparing ${kver} ===";
+            touch "/lib/modules/${kver}/modules.builtin"
+            depmod ${kver}
+            echo "=== Testing ${kver} ===";
+            ret=$(make KERNELRELEASE="${kver}" >&2; echo $?)
+            if [ ${ret} -eq 0 ]; then
+              succeeded="${succeeded} ${kver}"
+              test ! -e /lib/modules/${kver}/modules.dep || ret=$(modinfo -k ${kver} v4l2loopback.ko >&2; echo $?)
+            fi
+            if [ ${ret} -ne 0 ]; then
+              case " ${JOB_KNOWN_FAILURES} " in
+              *" ${kver} "*)
+                echo "#### Skipped known failure ${kver}";
+                soft_failed="${soft_failed} ${kver}";
+                ;;
+              *" ${kver%.*} "*)
+                echo "#### Skipped known failure ${kver}";
+                soft_failed="${soft_failed} ${kver}";
+                ;;
+              *)
+                if test -e "${kbuild}/.config" && ! grep -qE "^(CONFIG_VIDEO_DEV|CONFIG_VIDEO_V4L2)=" "${kbuild}/.config"; then
+                  echo "#### Skipped failure ${kver} (no v4l2 support)";
+                  skipped="${skipped} ${kver}";
+                else
+                  echo "#### Unexpected failure ${kver}";
+                  failed="${failed} ${kver}";
+                fi;
+                ;;
+              esac;
+            fi;
+            make KERNELRELEASE="${kver}" clean || test ${ret} -ne 0
+          done
+
+          # record & report the build state
+          statefile=buildstate.txt
+          osname="$(lsb_release -si)"
+          osversion="$(lsb_release -sr)"
+          osrelease="$(lsb_release -sc)"
+          test "${osrelease}" != "n/a" || osrelease="${osversion}"
+          test "${osrelease}" != "rolling" || osrelease="$(date +%Y%m%d)"
+          rm -rf "${statefile}"
+          for k in ${succeeded}; do
+            echo "${osname} ${osversion} ${osrelease} ${k} success"
+          done >> "${statefile}"
+          for k in ${skipped}; do
+            echo "${osname} ${osversion} ${osrelease} ${k} skip"
+          done >> "${statefile}"
+          for k in ${soft_failed}; do
+            echo "${osname} ${osversion} ${osrelease} ${k} softfail"
+          done >> "${statefile}"
+          for k in ${failed}; do
+            echo "${osname} ${osversion} ${osrelease} ${k} failure"
+          done >> "${statefile}"
+          echo "#### Successful builds for kernels: ${succeeded}";
+          if [ "x${skipped}" != "x" ]; then
+            echo "#### Skipped kernels: ${skipped}";
+          fi
+          if [ "x${soft_failed}" != "x" ]; then
+            echo "#### Skipped failed kernels: ${soft_failed}";
+          fi
+          if [ "x${failed}" != "x" ]; then
+            echo "#### Failed kernels: ${failed}";
+            exit 1
+          fi
+      - name: Publish state
+        if: success() || failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.name }}
+          path: buildstate.txt
+
+  make_badges:
+    if: always()
+    needs: kmod-compile
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout WIKI repository
+        uses: actions/checkout@v7
+        with:
+          repository: v4l2loopback/v4l2loopback.wiki.git
+          ref: master
+          token: ${{ secrets.PUSH2REPO_TOKEN }}
+      - name: Get status artifacts
+        uses: actions/download-artifact@v7
+      - name: Create badge
+        id: createbadge
+        shell: bash
+        run: |
+          badge=build-state.svg
+          echo "badge=${badge}" >> ${GITHUB_OUTPUT}
+          find */ -type f -name "buildstate.txt" -exec grep -h . {} + | sort -uf > allstates.txt
+          cat -n allstates.txt
+          numtests=$(grep -c . allstates.txt)
+          echo -n > "${badge}"
+          echo '<?xml version="1.0" encoding="UTF-8"?> <svg xmlns="http://www.w3.org/2000/svg" width="333" height="@height@">' | sed -e "s|@height@|$((numtests*22))|g">> "${badge}"
+          echo '<style>.success {fill:#4C1} .skip {fill:#D3D3D3} .softfail {fill:#FE7D37} .failure {fill:#E05D44}</style> <g fill="#fff" text-anchor="left" font-family="DejaVu Sans,Verdana,Geneva,sans-serif" font-size="11"> <linearGradient id="b" x2="0" y2="100%"> <stop offset="0" stop-color="#bbb" stop-opacity=".1"/> <stop offset="1" stop-opacity=".1"/> </linearGradient>' | sed -e "s|@height@|$((numtests * 22))|g" >> "${badge}"
+          cat -n allstates.txt | while read num os _ version kernel state; do
+            dy=$(((num-1)*22))
+            echo '<g transform="translate(0 @dy@)" mask="url(#anybadge_1)"> <path fill="#555" d="M0 0h148v20H0z"/> <path class="@state@" d="M148 0h185v20H148z"/> <path fill="url(#b)" d="M0 0h333v20H0z"/> <text x="9.0" y="15" fill="#010101" fill-opacity=".3">@os@/@version@</text> <text x="8.0" y="14">@os@/@version@</text> <text x="156.5" y="15" fill="#010101" fill-opacity=".3">@kernel@</text> <text x="155.5" y="14">@kernel@</text> </g>' | sed -e "s|@dy@|${dy}|g" -e "s|@state@|${state}|g" -e "s|@os@|${os}|g" -e "s|@version@|${version}|g" -e "s|@kernel@|${kernel}|g"
+          done >> "${badge}"
+          echo '</g> </svg>' >> "${badge}"
+          cat "${badge}"
+      - name: Deploy badge to wiki
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          badge: ${{ steps.createbadge.outputs.badge }}
+        run: |
+          echo "${badge}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "${badge}"
+          git commit -m "Update build-state.svg for ${{ github.sha }}" || echo "no change"
+          git push
