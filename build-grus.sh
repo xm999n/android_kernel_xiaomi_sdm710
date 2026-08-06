@@ -95,6 +95,18 @@ require_cmd "${ARM32_PREFIX}nm"
 mkdir -p "$OUT_DIR"
 cp "$CONFIG_SOURCE" "$OUT_DIR/.config"
 
+echo "== v4l2loopback source =="
+# drivers/Makefile references drivers/virtual_camera via obj-y; ensure the
+# directory exists before kbuild scans it. In CI the checkout won't have it
+# (it's an independent repo), so clone upstream when missing.
+VC_DIR="$ROOT_DIR/drivers/virtual_camera"
+if [[ ! -f "$VC_DIR/v4l2loopback.c" ]]; then
+  rm -rf "$VC_DIR"
+  git clone --depth 1 https://github.com/umlaeute/v4l2loopback.git "$VC_DIR"
+else
+  echo "v4l2loopback source already present, skipping clone"
+fi
+
 echo "== Toolchains =="
 echo "CLANG_BIN_DIR=$CLANG_BIN_DIR"
 echo "A64_PREFIX=$A64_PREFIX"
@@ -120,7 +132,26 @@ make "${make_args[@]}" olddefconfig
 echo
 
 echo "== build =="
-make -j"$JOBS" "${make_args[@]}" Image.gz dtbs
+make -j"$JOBS" "${make_args[@]}" Image.gz dtbs modules
+echo
+
+echo "== sign modules =="
+# CONFIG_MODULE_SIG_FORCE=y requires .ko to be signed; CONFIG_MODULE_SIG_ALL=y
+# should auto-sign during modules_install but not always during plain `modules`,
+# so sign explicitly here to be safe. Hash matches CONFIG_MODULE_SIG_HASH.
+SIG_HASH="sha512"
+SIGN_KEY="$OUT_DIR/certs/signing_key.pem"
+SIGN_X509="$OUT_DIR/certs/signing_key.x509"
+SIGN_TOOL="$OUT_DIR/scripts/sign-file"
+[[ -f "$SIGN_KEY"  ]] || die "missing signing key: $SIGN_KEY"
+[[ -f "$SIGN_X509" ]] || die "missing signing cert: $SIGN_X509"
+[[ -x "$SIGN_TOOL" ]] || die "missing sign-file tool: $SIGN_TOOL"
+ko_count=0
+while IFS= read -r -d '' ko; do
+  "$SIGN_TOOL" "$SIG_HASH" "$SIGN_KEY" "$SIGN_X509" "$ko"
+  ko_count=$((ko_count+1))
+done < <(find "$OUT_DIR" -name '*.ko' -print0)
+echo "signed $ko_count module(s)"
 echo
 
 echo "== Outputs =="
