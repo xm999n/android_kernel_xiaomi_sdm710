@@ -2,6 +2,11 @@ name: Build grus kernel
 
 on:
   workflow_dispatch:
+    inputs:
+      boot_img_url:
+        description: "Optional: direct-download URL of a stock boot.img (v2). If set, the build repacks it with the new kernel and uploads the patched boot alongside the normal artifacts."
+        required: false
+        default: ""
   push:
     branches:
       - main
@@ -44,6 +49,20 @@ jobs:
             libelf-dev \
             libssl-dev \
             python3
+
+      - name: Download boot image (optional)
+        if: ${{ github.event.inputs.boot_img_url != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "[+] Downloading stock boot.img from provided URL"
+          curl -LSs --fail --retry 5 --retry-delay 3 --connect-timeout 30 \
+            "${{ github.event.inputs.boot_img_url }}" -o "$GITHUB_WORKSPACE/boot.img"
+          test -s "$GITHUB_WORKSPACE/boot.img" || { echo "[-] boot.img download failed / empty"; exit 1; }
+          if [ "$(head -c 8 "$GITHUB_WORKSPACE/boot.img")" != "ANDROID!" ]; then
+            echo "[-] Downloaded file is not an Android boot image (no ANDROID! magic)."; exit 1;
+          fi
+          ls -la "$GITHUB_WORKSPACE/boot.img"
 
       - name: Download toolchains
         shell: bash

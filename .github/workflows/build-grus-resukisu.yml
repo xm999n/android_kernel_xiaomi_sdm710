@@ -247,6 +247,14 @@ jobs:
           cp "$OUT_DIR/arch/arm64/boot/dts/qcom/grus-sdm710-overlay.dtbo" "$ARTIFACT_DIR/"
           cp "$OUT_DIR/.config" "$ARTIFACT_DIR/kernel.config"
 
+          # Collect signed kernel modules, preserving relative paths
+          mkdir -p "$ARTIFACT_DIR/modules"
+          while IFS= read -r -d '' ko; do
+            rel="${ko#$OUT_DIR/}"
+            mkdir -p "$ARTIFACT_DIR/modules/$(dirname "$rel")"
+            cp "$ko" "$ARTIFACT_DIR/modules/$rel"
+          done < <(find "$OUT_DIR" -name '*.ko' -print0)
+
           if [[ -f "$GITHUB_WORKSPACE/boot.img" ]]; then
             python3 merge_bootimg.py \
               --boot "$GITHUB_WORKSPACE/boot.img" \
