@@ -52,8 +52,9 @@ jobs:
           fetch-depth: 0
 
       - name: Revert the two "SELinux Policy" commits' source changes
-        # The branch ships two SELinux Policy commits (93239a239cc7 and
-        # 59c62052c5bb) that heavily patch security/selinux/selinuxfs.c and
+        # The branch ships two SELinux Policy commits (1b7f3d13f25a and
+        # 61658c9faad5, rewriting the earlier 93239a239cc7 / 59c62052c5bb) that
+        # heavily patch security/selinux/selinuxfs.c and
         # security/selinux/ss/services.c. ReSukiSU's manual hooks are written
         # against the upstream (pre-policy) versions of these files, so restore
         # them from 1146a5f3cf5a — the commit immediately before those two — to
@@ -169,9 +170,14 @@ jobs:
           #   revert  -> read_write.c (ksu_vfs_read_hook is "incompatible"),
           #              security.c   (ksu_handle_rename is "incompatible"),
           #              and sys.c / input.c / selinux hooks (handled by LSM auto-hooks)
-          # NOTE: services.c is reverted to the pre-SELinux-policy base
-          # (1146a5f3cf5a) rather than HEAD, because HEAD carries the two
-          # "SELinux Policy" commits we removed in the earlier restore step.
+          # NOTE: hooks.c and services.c are reverted to the pre-SELinux-policy
+          # base (1146a5f3cf5a) rather than HEAD: services.c is restored in the
+          # earlier step, and hooks.c must match because HEAD's setprocattr
+          # hook calls kp_context_is_denied()/kp_caller_is_root_trusted() which
+          # do not exist in the restored (pre-policy) services.c — the selinux
+          # hooks are handled by ReSukiSU's LSM auto-hooks instead.  The two
+          # "SELinux Policy" commits (1b7f3d13f25a / 61658c9faad5) carry these
+          # changes.
           echo "::group::syscall manual hooks"
           bash "$HOOKS_DIR/syscall_hook_patches.sh"
           echo "::endgroup::"
@@ -179,10 +185,10 @@ jobs:
             fs/read_write.c \
             security/security.c \
             drivers/input/input.c \
-            kernel/sys.c \
-            security/selinux/hooks.c
+            kernel/sys.c
           git checkout 1146a5f3cf5a0c5d9ea2457cfa0515ef57b2317b -- \
-            security/selinux/ss/services.c
+            security/selinux/ss/services.c \
+            security/selinux/hooks.c
           echo "[+] Kept hooks (ksu_handle count):"
           for f in fs/exec.c fs/open.c fs/stat.c kernel/reboot.c; do
             echo "    $f: $(grep -c ksu_handle "$f" || true)"
@@ -246,6 +252,14 @@ jobs:
           cp "$OUT_DIR/arch/arm64/boot/dts/qcom/sdm710.dtb" "$ARTIFACT_DIR/"
           cp "$OUT_DIR/arch/arm64/boot/dts/qcom/grus-sdm710-overlay.dtbo" "$ARTIFACT_DIR/"
           cp "$OUT_DIR/.config" "$ARTIFACT_DIR/kernel.config"
+
+          # Collect signed kernel modules, preserving relative paths
+          mkdir -p "$ARTIFACT_DIR/modules"
+          while IFS= read -r -d '' ko; do
+            rel="${ko#$OUT_DIR/}"
+            mkdir -p "$ARTIFACT_DIR/modules/$(dirname "$rel")"
+            cp "$ko" "$ARTIFACT_DIR/modules/$rel"
+          done < <(find "$OUT_DIR" -name '*.ko' -print0)
 
           if [[ -f "$GITHUB_WORKSPACE/boot.img" ]]; then
             python3 merge_bootimg.py \
