@@ -1,0 +1,266 @@
+name: Build grus kernel (ReSukiSU)
+
+# ReSukiSU build for the grus (Xiaomi sdm710, msm-4.9) kernel.
+#
+# ReSukiSU is used instead of SukiSU-Ultra because it ships real Non-GKI / 4.9
+# compatibility (flex_array-era SELinux support + a working selinux_hide for
+# <5.10), so nothing has to be stubbed out. Its kernel driver is compatible with
+# the SukiSU-Ultra manager app (CONFIG_KSU_MULTI_MANAGER_SUPPORT).
+#
+# Hook model (verified locally on this kernel):
+#   - CONFIG_KSU_MANUAL_HOOK=y  (Non-GKI: tracepoint hooks are GKI-2.0 only)
+#   - setuid / init-rc / input  -> ReSukiSU LSM auto-hooks (AUTO_*_HOOK=y)
+#   - exec / faccessat / stat / reboot -> manual kernel-side hooks (below)
+# No SuSFS, no KPM (ReSukiSU has no KPM).
+
+on:
+  workflow_dispatch:
+    inputs:
+      resukisu_ref:
+        description: "ReSukiSU ref for setup.sh (branch/tag/commit). Use 'main'."
+        required: false
+        default: "main"
+      boot_img_url:
+        description: "Optional: direct-download URL of a stock boot.img (v2). If set, the build repacks it with the new kernel and uploads the patched boot alongside the normal artifacts."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-grus-resukisu-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    env:
+      OUT_DIR: ${{ github.workspace }}/out/grus-resukisu
+      TOOLCHAIN_DIR: ${{ github.workspace }}/.ci-toolchains
+      HOOKS_DIR: ${{ github.workspace }}/.github/resukisu
+      RESUKISU_REF: ${{ github.event.inputs.resukisu_ref || 'main' }}
+
+    steps:
+      - name: Checkout (full history)
+        # fetch-depth: 0 is required so the next step can restore selinuxfs.c /
+        # services.c from a pre-SELinux-policy commit.
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Revert the two "SELinux Policy" commits' source changes
+        # The branch ships two SELinux Policy commits (93239a239cc7 and
+        # 59c62052c5bb) that heavily patch security/selinux/selinuxfs.c and
+        # security/selinux/ss/services.c. ReSukiSU's manual hooks are written
+        # against the upstream (pre-policy) versions of these files, so restore
+        # them from 1146a5f3cf5a — the commit immediately before those two — to
+        # drop only those changes (they are the most-recent commits to touch
+        # these files, so nothing else is lost).
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          BASE="1146a5f3cf5a0c5d9ea2457cfa0515ef57b2317b"
+          for f in security/selinux/selinuxfs.c security/selinux/ss/services.c; do
+            git checkout "$BASE" -- "$f"
+            echo "[+] Restored $f from $BASE"
+          done
+          echo "[+] selinuxfs.c lines: $(wc -l < security/selinux/selinuxfs.c)"
+          echo "[+] services.c   lines: $(wc -l < security/selinux/ss/services.c)"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc \
+            bison \
+            build-essential \
+            cpio \
+            curl \
+            flex \
+            git \
+            libelf-dev \
+            libssl-dev \
+            python3 \
+            unzip \
+            zip
+
+      - name: Download boot image (optional)
+        if: ${{ github.event.inputs.boot_img_url != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "[+] Downloading stock boot.img from provided URL"
+          curl -LSs --fail --retry 5 --retry-delay 3 --connect-timeout 30 \
+            "${{ github.event.inputs.boot_img_url }}" -o "$GITHUB_WORKSPACE/boot.img"
+          test -s "$GITHUB_WORKSPACE/boot.img" || { echo "[-] boot.img download failed / empty"; exit 1; }
+          if [ "$(head -c 8 "$GITHUB_WORKSPACE/boot.img")" != "ANDROID!" ]; then
+            echo "[-] Downloaded file is not an Android boot image (no ANDROID! magic)."; exit 1
+          fi
+          ls -la "$GITHUB_WORKSPACE/boot.img"
+
+      - name: Download toolchains
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$TOOLCHAIN_DIR/clang-r536225" \
+                   "$TOOLCHAIN_DIR/aarch64-linux-android-4.9" \
+                   "$TOOLCHAIN_DIR/arm-linux-androideabi-4.9"
+
+          download_and_extract() {
+            local url="$1"
+            local dest_dir="$2"
+            local archive
+
+            archive="$(mktemp)"
+            curl --fail --location \
+              --retry 8 \
+              --retry-delay 5 \
+              --retry-all-errors \
+              --connect-timeout 30 \
+              --output "$archive" \
+              "$url"
+            tar -xzf "$archive" -C "$dest_dir"
+            rm -f "$archive"
+          }
+
+          download_and_extract \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/%2Barchive/7143812acf96c9af445b164656ae7f424a67a573/clang-r536225.tar.gz" \
+            "$TOOLCHAIN_DIR/clang-r536225"
+
+          download_and_extract \
+            "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/%2Barchive/0a0604336d4d1067aa1aaef8d3779b31fcee841d.tar.gz" \
+            "$TOOLCHAIN_DIR/aarch64-linux-android-4.9"
+
+          download_and_extract \
+            "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/%2Barchive/4d16d93f49c2b5ecdd0f12c38d194835dd595603.tar.gz" \
+            "$TOOLCHAIN_DIR/arm-linux-androideabi-4.9"
+
+      - name: Clean existing KernelSU / SuSFS hooks
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          echo "::group::clean_hook"
+          bash "$HOOKS_DIR/clean_hook.sh"
+          echo "::endgroup::"
+
+      - name: Integrate ReSukiSU
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          echo "[+] Installing ReSukiSU ref: $RESUKISU_REF"
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/refs/heads/main/kernel/setup.sh" | bash -s "$RESUKISU_REF"
+          test -e drivers/kernelsu || { echo "[-] ReSukiSU integration failed (no drivers/kernelsu)"; exit 1; }
+          echo "[+] ReSukiSU integrated."
+
+      - name: Apply manual hooks
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          # Apply the full manual-hook set, then keep only what ReSukiSU's
+          # manual_hook_check.mk wants in MANUAL_HOOK + AUTO(LSM) mode:
+          #   keep    -> fs/exec.c fs/open.c fs/stat.c kernel/reboot.c (+ seccomp/namei)
+          #   revert  -> read_write.c (ksu_vfs_read_hook is "incompatible"),
+          #              security.c   (ksu_handle_rename is "incompatible"),
+          #              and sys.c / input.c / selinux hooks (handled by LSM auto-hooks)
+          # NOTE: services.c is reverted to the pre-SELinux-policy base
+          # (1146a5f3cf5a) rather than HEAD, because HEAD carries the two
+          # "SELinux Policy" commits we removed in the earlier restore step.
+          echo "::group::syscall manual hooks"
+          bash "$HOOKS_DIR/syscall_hook_patches.sh"
+          echo "::endgroup::"
+          git checkout -- \
+            fs/read_write.c \
+            security/security.c \
+            drivers/input/input.c \
+            kernel/sys.c \
+            security/selinux/hooks.c
+          git checkout 1146a5f3cf5a0c5d9ea2457cfa0515ef57b2317b -- \
+            security/selinux/ss/services.c
+          echo "[+] Kept hooks (ksu_handle count):"
+          for f in fs/exec.c fs/open.c fs/stat.c kernel/reboot.c; do
+            echo "    $f: $(grep -c ksu_handle "$f" || true)"
+          done
+
+      - name: Prepare ReSukiSU kernel config
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          KSU_CONFIG="$GITHUB_WORKSPACE/.config.resukisu"
+          cp 1.md "$KSU_CONFIG"
+          {
+            echo "# --- ReSukiSU (added by build-grus-resukisu.yml) ---"
+            echo "CONFIG_KSU=y"
+            # Non-GKI: must use manual hooks (tracepoint hooks are GKI 2.0 only).
+            echo "CONFIG_KSU_MANUAL_HOOK=y"
+            # Accept ONLY the ReSukiSU manager (multi-manager off drops the
+            # tiann/rsuntk/SukiSU-Ultra/KOWX712 signatures; ReSukiSU stays).
+            echo "# CONFIG_KSU_MULTI_MANAGER_SUPPORT is not set"
+            # No SuSFS.
+            echo "# CONFIG_KSU_SUSFS is not set"
+          } >> "$KSU_CONFIG"
+          echo "KSU_CONFIG=$KSU_CONFIG" >> "$GITHUB_ENV"
+
+      - name: Build kernel (ReSukiSU)
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x ./build-grus.sh
+          CLANG_DIR="$TOOLCHAIN_DIR/clang-r536225/bin" \
+          A64_DIR="$TOOLCHAIN_DIR/aarch64-linux-android-4.9/bin" \
+          ARM32_DIR="$TOOLCHAIN_DIR/arm-linux-androideabi-4.9/bin" \
+          OUT_DIR="$OUT_DIR" \
+          CONFIG_SOURCE="$KSU_CONFIG" \
+          ./build-grus.sh
+
+      - name: Verify ReSukiSU integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          CFG="$OUT_DIR/.config"
+          echo "[+] Effective config:"
+          grep -E '^CONFIG_KSU(=|_MANUAL_HOOK|_SUSFS)' "$CFG" || true
+          grep -q '^CONFIG_KSU=y' "$CFG" \
+            || { echo "[-] CONFIG_KSU=y missing — ReSukiSU not compiled in."; exit 1; }
+          grep -q '^CONFIG_KSU_MANUAL_HOOK=y' "$CFG" \
+            || { echo "[-] CONFIG_KSU_MANUAL_HOOK=y missing (would fall back to GKI-only TP hooks)."; exit 1; }
+          echo "[+] ReSukiSU config verification passed."
+
+      - name: Prepare artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARTIFACT_DIR="$RUNNER_TEMP/grus-resukisu-artifacts"
+          mkdir -p "$ARTIFACT_DIR"
+
+          cp "$OUT_DIR/arch/arm64/boot/Image.gz" "$ARTIFACT_DIR/"
+          cp "$OUT_DIR/arch/arm64/boot/Image" "$ARTIFACT_DIR/"
+          cp "$OUT_DIR/arch/arm64/boot/dts/qcom/sdm670.dtb" "$ARTIFACT_DIR/"
+          cp "$OUT_DIR/arch/arm64/boot/dts/qcom/sdm710.dtb" "$ARTIFACT_DIR/"
+          cp "$OUT_DIR/arch/arm64/boot/dts/qcom/grus-sdm710-overlay.dtbo" "$ARTIFACT_DIR/"
+          cp "$OUT_DIR/.config" "$ARTIFACT_DIR/kernel.config"
+
+          if [[ -f "$GITHUB_WORKSPACE/boot.img" ]]; then
+            python3 merge_bootimg.py \
+              --boot "$GITHUB_WORKSPACE/boot.img" \
+              --kernel "$OUT_DIR/arch/arm64/boot/Image" \
+              --dtb "$OUT_DIR/arch/arm64/boot/dts/qcom/sdm670.dtb" \
+              --dtb "$OUT_DIR/arch/arm64/boot/dts/qcom/sdm710.dtb" \
+              --output "$ARTIFACT_DIR/boot-grus-resukisu.img"
+          fi
+
+          echo "ARTIFACT_DIR=$ARTIFACT_DIR" >> "$GITHUB_ENV"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: grus-resukisu-kernel-${{ github.run_number }}
+          path: ${{ env.ARTIFACT_DIR }}
+          if-no-files-found: error
