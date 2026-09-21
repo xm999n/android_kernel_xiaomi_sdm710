@@ -93,6 +93,10 @@
 #include "xfrm.h"
 #include "netlabel.h"
 #include "audit.h"
+
+/* adb_root hide: payload denylist + root-trusted caller gate (ss/services.c) */
+extern bool kp_context_is_denied(const char *ctx);
+extern bool kp_caller_is_root_trusted(void);
 #include "avc_ss.h"
 
 /* SECMARK reference count */
@@ -5921,6 +5925,20 @@ static int selinux_setprocattr(struct task_struct *p,
 		   security attributes. */
 		return -EACCES;
 	}
+
+	/*
+	 * adb_root hide (step 3, setcon via /proc/self/attr/current):
+	 * reject denylisted payloads (adbroot) with the same -EINVAL a
+	 * clean device without the domain returns -- unless the caller is
+	 * a root-trusted domain (adbd / init / magisk / su), which is how
+	 * the real adb root performs its domain transition.  setcon does
+	 * not go through the user-space AVC cache, so caller-gating here
+	 * is safe from cache-reuse bypasses.
+	 */
+	if (!strcmp(name, "current") && size && str && str[0] &&
+	    str[0] != '\n' && kp_context_is_denied(str) &&
+	    !kp_caller_is_root_trusted())
+		return -EINVAL;
 
 	/*
 	 * Basic control over ability to set these attributes at all.
