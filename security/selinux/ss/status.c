@@ -36,6 +36,7 @@
  * changed without any system call invocations.
  */
 static struct page *selinux_status_page;
+static struct page *kp_status_quiet_page;
 static DEFINE_MUTEX(selinux_status_lock);
 
 /*
@@ -73,6 +74,41 @@ struct page *selinux_kernel_status_page(void)
 	mutex_unlock(&selinux_status_lock);
 
 	return result;
+}
+
+/*
+ * kp_selinux_status_quiet_page
+ *
+ * adb_root hide: a second status page that always reports what a stock
+ * device reports to an app that opens the node after boot.  The real page
+ * is allocated on first open, so on a stock device every policy load has
+ * already happened by the time anything reads it and the counters are
+ * still zero; here the node is opened early (by the root tooling) and the
+ * real page carries the number of runtime injections instead.
+ *
+ * Handed out only to app_zygote callers, so every domain that actually
+ * watches policy updates -- init, system_server, su/magisk, lsposed --
+ * keeps the truthful page and its semantics.
+ */
+struct page *kp_selinux_status_quiet_page(void)
+{
+	struct selinux_kernel_status *status;
+
+	mutex_lock(&selinux_status_lock);
+	if (!kp_status_quiet_page) {
+		kp_status_quiet_page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+		if (kp_status_quiet_page) {
+			status = page_address(kp_status_quiet_page);
+			status->version = SELINUX_KERNEL_STATUS_VERSION;
+			status->sequence = 0;
+			status->enforcing = selinux_enforcing;
+			status->policyload = 0;
+			status->deny_unknown = !security_get_allow_unknown();
+		}
+	}
+	mutex_unlock(&selinux_status_lock);
+
+	return kp_status_quiet_page;
 }
 
 /*

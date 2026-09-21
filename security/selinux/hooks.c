@@ -93,6 +93,10 @@
 #include "xfrm.h"
 #include "netlabel.h"
 #include "audit.h"
+
+/* adb_root hide: payload denylist + root-trusted caller gate (ss/services.c) */
+extern bool kp_context_is_denied(const char *ctx);
+extern bool kp_caller_is_root_trusted(void);
 #include "avc_ss.h"
 
 /* SECMARK reference count */
@@ -5941,6 +5945,33 @@ static int selinux_setprocattr(struct task_struct *p,
 		error = -EINVAL;
 	if (error)
 		return error;
+
+	/*
+	 * adb_root hide (step 3, setcon via /proc/self/attr/current):
+	 * reject denylisted payloads (adbroot) with the same -EINVAL a
+	 * clean device without the domain returns -- unless the caller is
+	 * a root-trusted domain (adbd / init / magisk / su), which is how
+	 * the real adb root performs its domain transition.  setcon does
+	 * not go through the user-space AVC cache, so caller-gating here
+	 * is safe from cache-reuse bypasses.
+	 *
+	 * Placement matters twice:
+	 *  - after the PROCESS__SETCURRENT check, because a caller without
+	 *    setcurrent gets -EACCES on a clean device regardless of the
+	 *    payload; returning -EINVAL earlier would be a fingerprint in
+	 *    the errno itself.
+	 *  - before the str[0] != '\n' parse gate below, and deliberately
+	 *    not gated on it: the probe must cost the same on every
+	 *    "current" write, including newline-prefixed payloads that the
+	 *    parser skips.  Skipping the probe for those would make the
+	 *    control path cheaper than an ordinary payload and leak the
+	 *    hook through timing alone.  The answer does not change: a
+	 *    newline-prefixed denylisted payload from a trusted caller
+	 *    still ends in -EINVAL below via sid == 0.
+	 */
+	if (!strcmp(name, "current") && size && str &&
+	    kp_context_is_denied(str) && !kp_caller_is_root_trusted())
+		return -EINVAL;
 
 	/* Obtain a SID for the context, if one was specified. */
 	if (size && str[0] && str[0] != '\n') {

@@ -1527,42 +1527,30 @@ bool kp_caller_is_root_trusted(void)
 
 	read_lock(&policy_rwlock);
 	ctx = sidtab_search(&sidtab, tsec->sid);
-	if (ctx) {
+	if (ctx && ctx->type && ctx->type <= policydb.p_types.nprim) {
 		/*
 		 * Map the caller's type value back to its domain name via
-		 * the current policydb's p_types symtab (do NOT rely on
+		 * the current policydb's value->name array (do NOT rely on
 		 * ctx->str: it is only set for contexts created from
-		 * strings, not for binary-policy-loaded ones).  The symtab
-		 * is keyed by name with no reverse map, so walk it and
-		 * compare datum values.  This runs only when a denylisted
-		 * setcon payload arrives, so the linear scan is fine.
+		 * strings, not for binary-policy-loaded ones, and do NOT
+		 * walk p_types looking for a datum with a matching value:
+		 * that is O(number of types) and a clean device answers
+		 * -EINVAL after two symtab lookups, so the walk would be
+		 * trivially visible in the timing of an adbroot probe).
+		 * Reading the array keeps the current-policydb semantics,
+		 * so runtime-injected su/magisk domains still resolve.
 		 */
-		struct hashtab *t = policydb.p_types.table;
-		u32 i;
+		const char *name = sym_name(&policydb, SYM_TYPES,
+					    ctx->type - 1);
+		static const char * const trusted[] = {
+			"adbd", "init", "magisk", "su",
+		};
+		size_t j;
 
-		for (i = 0; i < t->size && !ret; i++) {
-			struct hashtab_node *n;
-
-			for (n = t->htable[i]; n; n = n->next) {
-				const struct type_datum *td = n->datum;
-
-				if (td->value == ctx->type) {
-					const char *name = n->key;
-					static const char * const trusted[] = {
-						"adbd", "init", "magisk", "su",
-					};
-					size_t j;
-
-					for (j = 0; j < ARRAY_SIZE(trusted);
-					     j++) {
-						if (!strcmp(name,
-							    trusted[j])) {
-							ret = true;
-							break;
-						}
-					}
-					break;
-				}
+		for (j = 0; name && j < ARRAY_SIZE(trusted); j++) {
+			if (!strcmp(name, trusted[j])) {
+				ret = true;
+				break;
 			}
 		}
 	}
@@ -1600,7 +1588,7 @@ static const char * const kp_denied_types[] = {
  * context string and compare it exactly against @type. */
 static bool kp_ctx_type_is(const char *ctx, const char *type)
 {
-	const char *p, *end;
+	const char *p;
 	size_t type_len;
 
 	if (!ctx || !type)
@@ -1617,14 +1605,23 @@ static bool kp_ctx_type_is(const char *ctx, const char *type)
 
 	/*
 	 * The type field runs from here to the next ':' (the MLS level
-	 * field) or to the end of the string, whichever comes first.
+	 * field) or to the end of the string, whichever comes first:
 	 * "u:r:adbroot:s0", "u:r:adbroot:s0:c0" and "u:r:adbroot" all
 	 * yield type "adbroot".
+	 *
+	 * Compare exactly strlen(type) bytes and require the field to end
+	 * there, instead of measuring it with strchr()/strlen() first: the
+	 * measuring form makes the probe cost grow with the payload
+	 * length, which is a timing term the context parser does not have
+	 * in the same shape.  This form touches a constant number of
+	 * bytes.
 	 */
-	end = strchr(p, ':');
-	type_len = end ? (size_t)(end - p) : strlen(p);
+	type_len = strlen(type);
 
-	return strlen(type) == type_len && !strncmp(type, p, type_len);
+	if (strncmp(p, type, type_len))
+		return false;
+
+	return p[type_len] == ':' || p[type_len] == '\0';
 }
 
 bool kp_context_is_denied(const char *ctx)

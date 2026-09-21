@@ -237,7 +237,18 @@ static const struct file_operations sel_handle_unknown_ops = {
 
 static int sel_open_handle_status(struct inode *inode, struct file *filp)
 {
-	struct page    *status = selinux_kernel_status_page();
+	struct page    *status = NULL;
+
+	/*
+	 * adb_root hide: app_zygote gets the quiet page (zero counters, the
+	 * shape a stock device has when the node is opened after boot);
+	 * everyone else keeps the real page, including its sequence
+	 * updates, so nothing that watches policy loads is disturbed.
+	 */
+	if (kp_current_is_app_zygote())
+		status = kp_selinux_status_quiet_page();
+	if (!status)
+		status = selinux_kernel_status_page();
 
 	if (!status)
 		return -ENOMEM;
@@ -449,14 +460,24 @@ static ssize_t sel_read_policy(struct file *filp, char __user *buf,
 	struct policy_load_memory *plm = filp->private_data;
 	int ret;
 
-	if (kp_current_is_app_zygote())
-		return -EACCES;
-
 	mutex_lock(&sel_mutex);
 
 	ret = task_has_security(current, SECURITY__READ_POLICY);
 	if (ret)
 		goto out;
+
+	/*
+	 * adb_root hide: keep this under sel_mutex and after the
+	 * permission check.  Returning early would skip the mutex that
+	 * stock always takes here, so an app_zygote would get -EACCES
+	 * without ever contending while a stock device blocks behind a
+	 * concurrent policy load -- a latency difference that shows up
+	 * exactly when the node is busy.
+	 */
+	if (kp_current_is_app_zygote()) {
+		ret = -EACCES;
+		goto out;
+	}
 
 	ret = simple_read_from_buffer(buf, count, ppos, plm->data, plm->len);
 out:
@@ -586,18 +607,27 @@ static ssize_t sel_write_context(struct file *file, char *buf, size_t size)
 	u32 sid, len;
 	ssize_t length;
 
+	length = task_has_security(current, SECURITY__CHECK_CONTEXT);
+	if (length)
+		goto out;
+
 	/*
 	 * adb_root hide (step 1 of the AppZygote detector): reject context
 	 * validation of denylisted payloads (adbroot has no legitimate
 	 * querier) with the same -EINVAL a clean device without the domain
 	 * returns.
+	 *
+	 * After the permission check on purpose: a caller without
+	 * CHECK_CONTEXT gets -EACCES from stock no matter what the payload
+	 * is, so answering -EINVAL first would be a fingerprint in the
+	 * errno, and would make this node answer differently from the
+	 * access/create/relabel/user/member nodes, which check permissions
+	 * before the payload.
 	 */
-	if (kp_context_is_denied(buf))
-		return -EINVAL;
-
-	length = task_has_security(current, SECURITY__CHECK_CONTEXT);
-	if (length)
+	if (kp_context_is_denied(buf)) {
+		length = -EINVAL;
 		goto out;
+	}
 
 	length = security_context_to_sid(buf, size, &sid, GFP_KERNEL);
 	if (length)
@@ -866,6 +896,15 @@ static ssize_t sel_write_access(struct file *file, char *buf, size_t size)
 		 */
 		if (kp_access_edge_violates_user_policy(scon, tcon))
 			avd.allowed = 0;
+		/*
+		 * adb_root hide: same carrier, same reason.  The epoch in
+		 * this response must look like the one on the quiet status
+		 * page (a stock device's single boot load), otherwise the
+		 * two sources disagree and the split itself is the oracle.
+		 * Only this caller is affected; su/magisk/lsposed queries
+		 * keep the live latest_granting.
+		 */
+		avd.seqno = 1;
 	} else
 		security_compute_av_user(ssid, tsid, tclass, &avd);
 
