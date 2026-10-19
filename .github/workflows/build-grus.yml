@@ -90,7 +90,7 @@ jobs:
           }
 
           download_and_extract \
-            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/%2Barchive/7143812acf96c9af445b164656ae7f424a67a573/clang-r536225.tar.gz" \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/mirror-goog-main-llvm-toolchain-source/clang-r596125.tar.gz" \
             "$TOOLCHAIN_DIR/clang-r536225"
 
           download_and_extract \

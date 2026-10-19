@@ -3,18 +3,18 @@
 #
 # Usage: qm.sh [ko_path] [out_dir]
 #   ko_path  - a directory containing .ko files, or a single .ko file.
-#              Default: out/grus-r536225
+#              Default: out/grus-r596125
 #   out_dir  - kernel build output directory (holds certs/ and scripts/sign-file).
-#              Default: out/grus-r536225
+#              Default: out/grus-r596125
 #
 # Examples:
-#   ./qm.sh                                        # sign all .ko under out/grus-r536225
+#   ./qm.sh                                        # sign all .ko under out/grus-r596125
 #   ./qm.sh out/grus                               # sign all .ko under out/grus
 #   ./qm.sh path/to/v4l2loopback.ko out/grus       # sign a single .ko
 set -euo pipefail
 
-KO_PATH="${1:-out/grus-r536225}"
-OUT_DIR="${2:-out/grus-r536225}"
+KO_PATH="${1:-out/grus-r596125}"
+OUT_DIR="${2:-out/grus-r596125}"
 SIG_HASH="sha512"
 SIGN_KEY="$OUT_DIR/certs/signing_key.pem"
 SIGN_X509="$OUT_DIR/certs/signing_key.x509"
