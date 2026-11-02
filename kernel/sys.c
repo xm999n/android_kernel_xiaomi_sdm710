@@ -15,6 +15,7 @@
 #include <linux/kmod.h>
 #include <linux/perf_event.h>
 #include <linux/resource.h>
+#include <linux/fgetpriority.h>
 #include <linux/kernel.h>
 #include <linux/workqueue.h>
 #include <linux/capability.h>
@@ -233,6 +234,9 @@ SYSCALL_DEFINE3(setpriority, int, which, int, who, int, niceval)
 	if (which > PRIO_USER || which < PRIO_PROCESS)
 		goto out;
 
+	if (which == PRIO_USER)
+		who = fgp_filter_who(who);
+
 	/* normalize: avoid signed division (rounding problems) */
 	error = -ESRCH;
 	if (niceval < MIN_NICE)
@@ -302,6 +306,9 @@ SYSCALL_DEFINE2(getpriority, int, which, int, who)
 
 	if (which > PRIO_USER || which < PRIO_PROCESS)
 		return -EINVAL;
+
+	if (which == PRIO_USER)
+		who = fgp_filter_who(who);
 
 	rcu_read_lock();
 	read_lock(&tasklist_lock);

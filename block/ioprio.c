@@ -23,6 +23,7 @@
 #include <linux/kernel.h>
 #include <linux/export.h>
 #include <linux/ioprio.h>
+#include <linux/fgetpriority.h>
 #include <linux/blkdev.h>
 #include <linux/capability.h>
 #include <linux/syscalls.h>
@@ -87,6 +88,9 @@ SYSCALL_DEFINE3(ioprio_set, int, which, int, who, int, ioprio)
 		default:
 			return -EINVAL;
 	}
+
+	if (which == IOPRIO_WHO_USER)
+		who = fgp_filter_who(who);
 
 	ret = -ESRCH;
 	rcu_read_lock();
@@ -186,6 +190,9 @@ SYSCALL_DEFINE2(ioprio_get, int, which, int, who)
 	kuid_t uid;
 	int ret = -ESRCH;
 	int tmpio;
+
+	if (which == IOPRIO_WHO_USER)
+		who = fgp_filter_who(who);
 
 	rcu_read_lock();
 	switch (which) {
